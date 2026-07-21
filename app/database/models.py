@@ -2151,6 +2151,13 @@ class User(Base):
         return False
 
 
+def _default_wl_traffic_limit_gb() -> int:
+    """Значение по умолчанию для wl_traffic_limit_gb новых подписок."""
+    from app.config import settings
+
+    return int(getattr(settings, 'WL_TRAFFIC_DEFAULT_LIMIT_GB', 0) or 0)
+
+
 class Subscription(Base):
     __tablename__ = 'subscriptions'
     __table_args__ = (
@@ -2181,6 +2188,10 @@ class Subscription(Base):
 
     traffic_limit_gb = Column(Integer, default=0)
     traffic_used_gb = Column(Float, default=0.0)
+    wl_traffic_limit_gb = Column(
+        Integer, default=_default_wl_traffic_limit_gb, server_default='0', nullable=False
+    )  # WL (БС) лимит, 0 = безлимит (по умолчанию из WL_TRAFFIC_DEFAULT_LIMIT_GB)
+    wl_traffic_used_gb = Column(Float, default=0.0, server_default='0', nullable=False)  # Кэш WL (БС) использованного трафика
     purchased_traffic_gb = Column(Integer, default=0)  # Докупленный трафик
     traffic_reset_at = Column(
         AwareDateTime(), nullable=True
@@ -2359,6 +2370,13 @@ class Subscription(Base):
             return 0.0
         used = self.traffic_used_gb or 0.0
         return min((used / self.traffic_limit_gb) * 100, 100.0)
+
+    @property
+    def wl_traffic_used_percent(self) -> float:
+        if not self.wl_traffic_limit_gb:
+            return 0.0
+        used = self.wl_traffic_used_gb or 0.0
+        return min((used / self.wl_traffic_limit_gb) * 100, 100.0)
 
     def extend_subscription(self, days: int):
         end = _aware(self.end_date)

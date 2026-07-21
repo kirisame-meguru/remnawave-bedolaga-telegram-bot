@@ -1263,6 +1263,16 @@ class RemnaWaveAPI:
         response = await self._make_request('GET', f'/api/bandwidth-stats/users/{user_uuid}/legacy', params=params)
         return response
 
+    async def get_bandwidth_stats_user_inbounds(
+        self, user_uuid: str, start_date: str, end_date: str, top_inbounds_limit: int = 100
+    ) -> dict[str, Any]:
+        # Per-user per-inbound usage. Requires a Remnawave panel that tracks traffic per inbound
+        # (inbounds flagged trackTrafficPerUser / trackUserUsage). Returns response with
+        # topInbounds[] = {uuid, tag, type, port, total} where total is bytes over [start, end].
+        params = {'start': start_date, 'end': end_date, 'topInboundsLimit': top_inbounds_limit}
+        response = await self._make_request('GET', f'/api/bandwidth-stats/users/{user_uuid}/inbounds', params=params)
+        return response['response']
+
     # ============== Subscription Page Configs API ==============
 
     async def get_subscription_page_configs(self) -> list[SubscriptionPageConfig]:
