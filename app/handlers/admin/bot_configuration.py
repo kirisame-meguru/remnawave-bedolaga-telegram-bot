@@ -1393,9 +1393,7 @@ def _build_setting_keyboard(
             [
                 types.InlineKeyboardButton(
                     text='⚪ Выбрать WL-инбаунды',
-                    callback_data=(
-                        f'botcfg_wl_inb:{group_key}:{category_page}:{settings_page}:{callback_token}:1'
-                    ),
+                    callback_data=(f'botcfg_wl_inb:{group_key}:{category_page}:{settings_page}:{callback_token}:1'),
                 )
             ]
         )
@@ -1843,7 +1841,7 @@ def _parse_wl_inbound_uuids(raw_value: str) -> list[str]:
     """Parse the stored WL_INBOUND_UUIDS CSV into a lowercase uuid list (order preserved)."""
     if not raw_value:
         return []
-    value = raw_value.split('#')[0].strip()
+    value = raw_value.split('#', 1)[0].strip()
     if not value:
         return []
     return [item.strip().lower() for item in value.split(',') if item.strip()]
@@ -1899,9 +1897,7 @@ async def _render_wl_inbound_selector(
             [
                 types.InlineKeyboardButton(
                     text=' '.join(label_parts),
-                    callback_data=(
-                        f'botcfg_wl_tog:{group_key}:{category_page}:{settings_page}:{token}:{idx}:{page}'
-                    ),
+                    callback_data=(f'botcfg_wl_tog:{group_key}:{category_page}:{settings_page}:{token}:{idx}:{page}'),
                 )
             ]
         )
@@ -1974,9 +1970,7 @@ async def show_wl_inbound_selector(
         await callback.answer('Эта настройка больше недоступна', show_alert=True)
         return
 
-    await _render_wl_inbound_selector(
-        callback, db, token, key, group_key, category_page, settings_page, page
-    )
+    await _render_wl_inbound_selector(callback, db, token, key, group_key, category_page, settings_page, page)
     await callback.answer()
 
 
@@ -2026,9 +2020,7 @@ async def toggle_wl_inbound(
     inbounds = await RemnaWaveService().get_all_inbounds()
     if idx < 0 or idx >= len(inbounds):
         await callback.answer('Список инбаундов изменился, обновляю', show_alert=True)
-        await _render_wl_inbound_selector(
-            callback, db, token, key, group_key, category_page, settings_page, page
-        )
+        await _render_wl_inbound_selector(callback, db, token, key, group_key, category_page, settings_page, page)
         return
 
     target_uuid = str(inbounds[idx].get('uuid', '')).lower()
@@ -2047,9 +2039,7 @@ async def toggle_wl_inbound(
         return
     await db.commit()
 
-    await _render_wl_inbound_selector(
-        callback, db, token, key, group_key, category_page, settings_page, page
-    )
+    await _render_wl_inbound_selector(callback, db, token, key, group_key, category_page, settings_page, page)
     await callback.answer(answer)
 
 

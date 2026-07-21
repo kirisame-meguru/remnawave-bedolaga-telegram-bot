@@ -307,9 +307,7 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
         except Exception as e:
             logger.warning('Ошибка получения WL (БС) трафика', error=e)
             wl_stats = {'enabled': False, 'wl_used_gb': 0.0}
-        wl_used_gb = (
-            wl_stats['wl_used_gb'] if wl_stats.get('enabled') else (subscription.wl_traffic_used_gb or 0.0)
-        )
+        wl_used_gb = wl_stats['wl_used_gb'] if wl_stats.get('enabled') else (subscription.wl_traffic_used_gb or 0.0)
         wl_limit_gb = int(getattr(subscription, 'wl_traffic_limit_gb', 0) or 0)
         wl_limit_display = '∞' if wl_limit_gb <= 0 else str(wl_limit_gb)
         wl_traffic_display = f'{wl_used_gb:.1f} / {wl_limit_display} ГБ'

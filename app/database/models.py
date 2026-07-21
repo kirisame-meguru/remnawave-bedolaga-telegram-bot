@@ -2191,7 +2191,9 @@ class Subscription(Base):
     wl_traffic_limit_gb = Column(
         Integer, default=_default_wl_traffic_limit_gb, server_default='0', nullable=False
     )  # WL (БС) лимит, 0 = безлимит (по умолчанию из WL_TRAFFIC_DEFAULT_LIMIT_GB)
-    wl_traffic_used_gb = Column(Float, default=0.0, server_default='0', nullable=False)  # Кэш WL (БС) использованного трафика
+    wl_traffic_used_gb = Column(
+        Float, default=0.0, server_default='0', nullable=False
+    )  # Кэш WL (БС) использованного трафика
     purchased_traffic_gb = Column(Integer, default=0)  # Докупленный трафик
     traffic_reset_at = Column(
         AwareDateTime(), nullable=True

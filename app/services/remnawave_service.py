@@ -2841,9 +2841,7 @@ class RemnaWaveService:
             logger.error('Ошибка получения статистики трафика по UUID', remnawave_uuid=remnawave_uuid, error=e)
             return None
 
-    async def compute_user_wl_traffic_bytes(
-        self, remnawave_uuid: str, start_date: str, end_date: str
-    ) -> int:
+    async def compute_user_wl_traffic_bytes(self, remnawave_uuid: str, start_date: str, end_date: str) -> int:
         """Суммирует трафик пользователя по WL-инбаундам за период [start_date, end_date].
 
         WL-инбаунды задаются глобально (settings.WL_INBOUND_UUIDS). Требует панель
