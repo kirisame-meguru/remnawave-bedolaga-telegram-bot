@@ -328,8 +328,6 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
                 else None
             ) or db_user.remnawave_uuid
             if _device_uuid:
-                from app.services.remnawave_service import RemnaWaveService
-
                 service = RemnaWaveService()
 
                 async with service.get_api_client() as api:
