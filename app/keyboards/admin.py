@@ -195,6 +195,12 @@ def get_admin_settings_submenu_keyboard(language: str = 'ru') -> InlineKeyboardM
             ],
             [
                 InlineKeyboardButton(
+                    text=_t(texts, 'ADMIN_SETTINGS_TRAFFIC_DIMENSIONS', '📐 Измерения трафика'),
+                    callback_data='admin_traffic_dims',
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text=texts.t('ADMIN_MONITORING_SETTINGS', '⚙️ Настройки мониторинга'),
                     callback_data='admin_mon_settings',
                 )

@@ -48,6 +48,12 @@ class NotificationType(Enum):
     DAILY_INSUFFICIENT_FUNDS = 'daily_insufficient_funds'
     TRAFFIC_RESET = 'traffic_reset'
 
+    # Измерения трафика (WL и заведённые администратором)
+    TRAFFIC_DIMENSION_WARNING = 'traffic_dimension_warning'
+    TRAFFIC_DIMENSION_EXHAUSTED = 'traffic_dimension_exhausted'
+    TRAFFIC_DIMENSION_BLOCKED = 'traffic_dimension_blocked'
+    TRAFFIC_DIMENSION_RESTORED = 'traffic_dimension_restored'
+
     # Account notifications
     BAN_NOTIFICATION = 'ban_notification'
     UNBAN_NOTIFICATION = 'unban_notification'

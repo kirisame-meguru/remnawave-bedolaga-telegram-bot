@@ -2139,5 +2139,10 @@
   "LAVA_RECURRING_NOTIFY_CANCELLED": "ℹ️ تمدید خودکار Lava لغو شد.",
   "LAVA_RECURRING_NOTIFY_CONFIRMED": "✅ اشتراک با کسر خودکار Lava تمدید شد.",
   "LAVA_RECURRING_NOTIFY_FAILED": "⚠️ کسر وجه تمدید خودکار Lava ناموفق بود.",
-  "LAVA_RECURRING_PAY_BUTTON": "💳 پرداخت"
+  "LAVA_RECURRING_PAY_BUTTON": "💳 پرداخت",
+  "TRAFFIC_DIMENSION_WARNING": "⚠️ <b>{dimension}: ترافیک رو به اتمام است</b>\n\nمصرف‌شده: {used:.1f} / {limit} گیگابایت ({percent:.0f}%)\n\nبا پایان یافتن سقف، دسترسی این مسیر تا پایان دورهٔ محاسباتی بسته می‌شود. می‌توانید از بخش اشتراک ترافیک بیشتری بخرید.",
+  "TRAFFIC_DIMENSION_EXHAUSTED": "🚫 <b>{dimension}: سقف به پایان رسید</b>\n\n{used:.1f} گیگابایت از {limit} گیگابایت مصرف شد.\n\nبرای ادامهٔ استفاده از این مسیر، از بخش اشتراک ترافیک بیشتری بخرید.",
+  "TRAFFIC_DIMENSION_BLOCKED": "🚫 <b>{dimension}: دسترسی متوقف شد</b>\n\n{used:.1f} گیگابایت از {limit} گیگابایت مصرف شد.\n\nدسترسی این مسیر بسته شد. سایر مسیرها مثل همیشه کار می‌کنند. برای بازگرداندن دسترسی، از بخش اشتراک ترافیک بیشتری بخرید — یا تا شروع دورهٔ محاسباتی بعدی صبر کنید.",
+  "TRAFFIC_DIMENSION_RESTORED": "✅ <b>{dimension}: دسترسی بازگردانده شد</b>\n\nسقف دوباره در دسترس است: {limit} گیگابایت.",
+  "TRAFFIC_PACKAGE_UNAVAILABLE": "⚠️ این بسته دیگر در دسترس نیست"
 }

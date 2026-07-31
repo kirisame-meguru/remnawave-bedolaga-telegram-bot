@@ -2139,5 +2139,10 @@
   "LAVA_RECURRING_NOTIFY_CANCELLED": "ℹ️ Автопродовження Lava скасовано.",
   "LAVA_RECURRING_NOTIFY_CONFIRMED": "✅ Підписку продовжено автосписанням Lava.",
   "LAVA_RECURRING_NOTIFY_FAILED": "⚠️ Не вдалося списати оплату за автопродовженням Lava.",
-  "LAVA_RECURRING_PAY_BUTTON": "💳 Сплатити"
+  "LAVA_RECURRING_PAY_BUTTON": "💳 Сплатити",
+  "TRAFFIC_DIMENSION_WARNING": "⚠️ <b>{dimension}: трафік закінчується</b>\n\nВикористано: {used:.1f} / {limit} ГБ ({percent:.0f}%)\n\nКоли ліміт вичерпається, доступ за цим напрямком буде закрито до кінця розрахункового періоду. Докупити трафік можна в розділі підписки.",
+  "TRAFFIC_DIMENSION_EXHAUSTED": "🚫 <b>{dimension}: ліміт вичерпано</b>\n\nВитрачено {used:.1f} ГБ із {limit} ГБ.\n\nДокупіть трафік у розділі підписки, щоб продовжити користуватися цим напрямком.",
+  "TRAFFIC_DIMENSION_BLOCKED": "🚫 <b>{dimension}: доступ призупинено</b>\n\nВитрачено {used:.1f} ГБ із {limit} ГБ.\n\nДоступ за цим напрямком закрито. Інші напрямки працюють як зазвичай. Щоб повернути доступ, докупіть трафік у розділі підписки — або дочекайтеся початку наступного розрахункового періоду.",
+  "TRAFFIC_DIMENSION_RESTORED": "✅ <b>{dimension}: доступ відновлено</b>\n\nЛіміт знову доступний: {limit} ГБ.",
+  "TRAFFIC_PACKAGE_UNAVAILABLE": "⚠️ Цей пакет більше недоступний"
 }

@@ -18,7 +18,7 @@ from app.database.crud.transaction import get_user_total_spent_kopeks
 from app.database.crud.user import update_user
 from app.database.crud.user_message import get_random_active_message
 from app.database.models import InfoPage, PromoGroup, User
-from app.handlers.subscription.traffic import add_traffic, handle_add_traffic
+from app.handlers.subscription.traffic import add_traffic, add_traffic_package, handle_add_traffic
 from app.keyboards.inline import (
     get_info_menu_keyboard,
     get_language_selection_keyboard,
@@ -1783,5 +1783,7 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(handle_add_traffic, F.data == 'buy_traffic')
 
     dp.callback_query.register(add_traffic, F.data.startswith('add_traffic_'))
+    # Пакеты с начислениями по измерениям адресуются id, а не числом ГБ.
+    dp.callback_query.register(add_traffic_package, F.data.startswith('atp:'))
 
     dp.callback_query.register(handle_activate_button, F.data == 'activate_button')

@@ -38,7 +38,6 @@ logger = structlog.get_logger(__name__)
 CATEGORY_PAGE_SIZE = 10
 SETTINGS_PAGE_SIZE = 8
 SIMPLE_SUBSCRIPTION_SQUADS_PAGE_SIZE = 6
-WL_INBOUNDS_PAGE_SIZE = 8
 
 CATEGORY_GROUP_METADATA: dict[str, dict[str, object]] = {
     'core': {
@@ -1388,16 +1387,6 @@ def _build_setting_keyboard(
             ]
         )
 
-    if key == 'WL_INBOUND_UUIDS' and not is_read_only:
-        rows.append(
-            [
-                types.InlineKeyboardButton(
-                    text='⚪ Выбрать WL-инбаунды',
-                    callback_data=(f'botcfg_wl_inb:{group_key}:{category_page}:{settings_page}:{callback_token}:1'),
-                )
-            ]
-        )
-
     if definition.python_type is bool and not is_read_only:
         rows.append(
             [
@@ -1835,212 +1824,6 @@ async def select_simple_subscription_squad(
         settings_page=settings_page,
     )
     await callback.answer('Сквад выбран')
-
-
-def _parse_wl_inbound_uuids(raw_value: str) -> list[str]:
-    """Parse the stored WL_INBOUND_UUIDS CSV into a lowercase uuid list (order preserved)."""
-    if not raw_value:
-        return []
-    value = raw_value.split('#', 1)[0].strip()
-    if not value:
-        return []
-    return [item.strip().lower() for item in value.split(',') if item.strip()]
-
-
-async def _render_wl_inbound_selector(
-    callback: types.CallbackQuery,
-    db: AsyncSession,
-    token: str,
-    key: str,
-    group_key: str,
-    category_page: int,
-    settings_page: int,
-    page: int,
-) -> None:
-    inbounds = await RemnaWaveService().get_all_inbounds()
-    selected = set(_parse_wl_inbound_uuids(bot_configuration_service.get_current_value(key) or ''))
-
-    limit = WL_INBOUNDS_PAGE_SIZE
-    total_count = len(inbounds)
-    total_pages = max(1, math.ceil(total_count / limit)) if total_count else 1
-    page = min(max(1, page), total_pages)
-    page_items = inbounds[(page - 1) * limit : page * limit]
-
-    lines = [
-        '⚪ <b>WL-инбаунды (БС трафик)</b>',
-        '',
-        f'Выбрано инбаундов: {len(selected)}',
-        'Трафик по всем выбранным инбаундам суммируется в один WL-счётчик.',
-        '',
-    ]
-    if total_count == 0:
-        lines.append('❌ Инбаунды не найдены (проверьте подключение к панели RemnaWave).')
-    else:
-        lines.append('Нажмите на инбаунд, чтобы включить/выключить его в WL.')
-        if total_pages > 1:
-            lines.append(f'Страница {page}/{total_pages}')
-    text = '\n'.join(lines)
-
-    keyboard_rows: list[list[types.InlineKeyboardButton]] = []
-    for offset, inbound in enumerate(page_items):
-        idx = (page - 1) * limit + offset
-        is_selected = str(inbound.get('uuid', '')).lower() in selected
-        icon = '✅' if is_selected else '⚪'
-        label_parts = [icon, str(inbound.get('tag', '—'))]
-        type_bits = inbound.get('type')
-        port = inbound.get('port')
-        if type_bits and port:
-            label_parts.append(f'({type_bits}:{port})')
-        elif type_bits:
-            label_parts.append(f'({type_bits})')
-        keyboard_rows.append(
-            [
-                types.InlineKeyboardButton(
-                    text=' '.join(label_parts),
-                    callback_data=(f'botcfg_wl_tog:{group_key}:{category_page}:{settings_page}:{token}:{idx}:{page}'),
-                )
-            ]
-        )
-
-    if total_pages > 1:
-        nav_row: list[types.InlineKeyboardButton] = []
-        if page > 1:
-            nav_row.append(
-                types.InlineKeyboardButton(
-                    text='⬅️',
-                    callback_data=f'botcfg_wl_inb:{group_key}:{category_page}:{settings_page}:{token}:{page - 1}',
-                )
-            )
-        if page < total_pages:
-            nav_row.append(
-                types.InlineKeyboardButton(
-                    text='➡️',
-                    callback_data=f'botcfg_wl_inb:{group_key}:{category_page}:{settings_page}:{token}:{page + 1}',
-                )
-            )
-        if nav_row:
-            keyboard_rows.append(nav_row)
-
-    keyboard_rows.append(
-        [
-            types.InlineKeyboardButton(
-                text='⬅️ Назад',
-                callback_data=f'botcfg_setting:{group_key}:{category_page}:{settings_page}:{token}',
-            )
-        ]
-    )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
-        parse_mode='HTML',
-    )
-
-
-@admin_required
-@error_handler
-async def show_wl_inbound_selector(
-    callback: types.CallbackQuery,
-    db_user: User,
-    db: AsyncSession,
-    state: FSMContext,
-):
-    parts = callback.data.split(':', 5)
-    group_key = parts[1] if len(parts) > 1 else CATEGORY_FALLBACK_KEY
-    try:
-        category_page = max(1, int(parts[2])) if len(parts) > 2 else 1
-    except ValueError:
-        category_page = 1
-    try:
-        settings_page = max(1, int(parts[3])) if len(parts) > 3 else 1
-    except ValueError:
-        settings_page = 1
-    token = parts[4] if len(parts) > 4 else ''
-    try:
-        page = max(1, int(parts[5])) if len(parts) > 5 else 1
-    except ValueError:
-        page = 1
-
-    try:
-        key = bot_configuration_service.resolve_callback_token(token)
-    except KeyError:
-        await callback.answer('Эта настройка больше недоступна', show_alert=True)
-        return
-    if key != 'WL_INBOUND_UUIDS':
-        await callback.answer('Эта настройка больше недоступна', show_alert=True)
-        return
-
-    await _render_wl_inbound_selector(callback, db, token, key, group_key, category_page, settings_page, page)
-    await callback.answer()
-
-
-@admin_required
-@error_handler
-async def toggle_wl_inbound(
-    callback: types.CallbackQuery,
-    db_user: User,
-    db: AsyncSession,
-    state: FSMContext,
-):
-    parts = callback.data.split(':', 6)
-    group_key = parts[1] if len(parts) > 1 else CATEGORY_FALLBACK_KEY
-    try:
-        category_page = max(1, int(parts[2])) if len(parts) > 2 else 1
-    except ValueError:
-        category_page = 1
-    try:
-        settings_page = max(1, int(parts[3])) if len(parts) > 3 else 1
-    except ValueError:
-        settings_page = 1
-    token = parts[4] if len(parts) > 4 else ''
-    try:
-        idx = int(parts[5]) if len(parts) > 5 else None
-    except ValueError:
-        idx = None
-    try:
-        page = max(1, int(parts[6])) if len(parts) > 6 else 1
-    except ValueError:
-        page = 1
-
-    try:
-        key = bot_configuration_service.resolve_callback_token(token)
-    except KeyError:
-        await callback.answer('Эта настройка больше недоступна', show_alert=True)
-        return
-    if key != 'WL_INBOUND_UUIDS':
-        await callback.answer('Эта настройка больше недоступна', show_alert=True)
-        return
-    if bot_configuration_service.is_read_only(key):
-        await callback.answer('Эта настройка доступна только для чтения', show_alert=True)
-        return
-    if idx is None:
-        await callback.answer('Не удалось определить инбаунд', show_alert=True)
-        return
-
-    inbounds = await RemnaWaveService().get_all_inbounds()
-    if idx < 0 or idx >= len(inbounds):
-        await callback.answer('Список инбаундов изменился, обновляю', show_alert=True)
-        await _render_wl_inbound_selector(callback, db, token, key, group_key, category_page, settings_page, page)
-        return
-
-    target_uuid = str(inbounds[idx].get('uuid', '')).lower()
-    selected = _parse_wl_inbound_uuids(bot_configuration_service.get_current_value(key) or '')
-    if target_uuid in selected:
-        selected = [u for u in selected if u != target_uuid]
-        answer = 'Инбаунд убран из WL'
-    else:
-        selected.append(target_uuid)
-        answer = 'Инбаунд добавлен в WL'
-
-    try:
-        await bot_configuration_service.set_value(db, key, ','.join(selected))
-    except ReadOnlySettingError:
-        await callback.answer('Эта настройка доступна только для чтения', show_alert=True)
-        return
-    await db.commit()
-
-    await _render_wl_inbound_selector(callback, db, token, key, group_key, category_page, settings_page, page)
-    await callback.answer(answer)
 
 
 @admin_required
@@ -3187,14 +2970,6 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.callback_query.register(
         show_simple_subscription_squad_selector,
         F.data.startswith('botcfg_simple_squad:'),
-    )
-    dp.callback_query.register(
-        toggle_wl_inbound,
-        F.data.startswith('botcfg_wl_tog:'),
-    )
-    dp.callback_query.register(
-        show_wl_inbound_selector,
-        F.data.startswith('botcfg_wl_inb:'),
     )
     dp.callback_query.register(
         show_bot_config_setting,

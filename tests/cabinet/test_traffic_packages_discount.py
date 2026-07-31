@@ -18,7 +18,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.cabinet.routes.subscription_modules import traffic as traffic_route
-from app.database.models import PromoGroup, Subscription, User
+from app.database.models import PromoGroup, Subscription, Tariff, User
+
+
+async def _no_dimension_labels(db, language):
+    """Заголовки измерений живут в БД, которой в этих тестах нет."""
+    return {}
 
 
 def _make_user(*, traffic_discount_percent: int, apply_to_addons: bool = True) -> User:
@@ -74,6 +79,8 @@ def classic_mode(monkeypatch):
         return _make_subscription()
 
     monkeypatch.setattr(traffic_route, 'resolve_subscription', _fake_resolve)
+    # Заголовки измерений маршрут читает из БД, которой в этих тестах нет.
+    monkeypatch.setattr(traffic_route, '_dimension_labels', _no_dimension_labels)
 
 
 @pytest.mark.asyncio
@@ -130,11 +137,16 @@ async def test_traffic_packages_apply_discount_in_tariff_mode(monkeypatch):
     monkeypatch.setattr(settings_cls, 'is_tariffs_mode', lambda self: True)
 
     class _FakeTariff:
+        # Реальные методы модели: маршрут читает пакеты через них, а не через
+        # словарь, поэтому подменять их заглушкой значило бы тестировать не то.
         traffic_topup_enabled = True
         traffic_limit_gb = 200
+        traffic_topup_packages = {'50': 10000, '100': 18000}
 
-        def get_traffic_topup_packages(self):
-            return {50: 10000, 100: 18000}
+        get_traffic_packages = Tariff.get_traffic_packages
+        get_traffic_topup_packages = Tariff.get_traffic_topup_packages
+        get_purchasable_traffic_packages = Tariff.get_purchasable_traffic_packages
+        is_unlimited_traffic = False
 
     async def _fake_get_tariff(db, tariff_id):
         return _FakeTariff()
@@ -150,6 +162,8 @@ async def test_traffic_packages_apply_discount_in_tariff_mode(monkeypatch):
         return sub
 
     monkeypatch.setattr(traffic_route, 'resolve_subscription', _fake_resolve)
+    # Заголовки измерений маршрут читает из БД, которой в этих тестах нет.
+    monkeypatch.setattr(traffic_route, '_dimension_labels', _no_dimension_labels)
 
     user = _make_user(traffic_discount_percent=25)
 
@@ -177,6 +191,8 @@ async def test_traffic_packages_floor_displayed_price_at_one_ruble(monkeypatch):
         return _make_subscription()
 
     monkeypatch.setattr(traffic_route, 'resolve_subscription', _fake_resolve)
+    # Заголовки измерений маршрут читает из БД, которой в этих тестах нет.
+    monkeypatch.setattr(traffic_route, '_dimension_labels', _no_dimension_labels)
 
     user = _make_user(traffic_discount_percent=99)  # 99% of 5000 = 50 kopeks → floored to 100
 
@@ -212,6 +228,8 @@ async def test_traffic_packages_default_group_uses_prorated_period_hint(monkeypa
         return sub
 
     monkeypatch.setattr(traffic_route, 'resolve_subscription', _fake_resolve)
+    # Заголовки измерений маршрут читает из БД, которой в этих тестах нет.
+    monkeypatch.setattr(traffic_route, '_dimension_labels', _no_dimension_labels)
 
     pg = PromoGroup(
         name='Default',

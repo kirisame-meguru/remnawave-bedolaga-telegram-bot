@@ -2139,5 +2139,10 @@
   "LAVA_RECURRING_NOTIFY_CANCELLED": "ℹ️ 已取消 Lava 自动续订。",
   "LAVA_RECURRING_NOTIFY_CONFIRMED": "✅ 订阅已通过 Lava 自动扣款续订。",
   "LAVA_RECURRING_NOTIFY_FAILED": "⚠️ Lava 自动续订扣款失败。",
-  "LAVA_RECURRING_PAY_BUTTON": "💳 支付"
+  "LAVA_RECURRING_PAY_BUTTON": "💳 支付",
+  "TRAFFIC_DIMENSION_WARNING": "⚠️ <b>{dimension}：流量即将用尽</b>\n\n已使用：{used:.1f} / {limit} GB（{percent:.0f}%）\n\n额度用尽后，该线路的访问将被关闭，直到本计费周期结束。您可以在订阅页面加购流量。",
+  "TRAFFIC_DIMENSION_EXHAUSTED": "🚫 <b>{dimension}：额度已用尽</b>\n\n已使用 {used:.1f} GB，共 {limit} GB。\n\n请在订阅页面加购流量以继续使用该线路。",
+  "TRAFFIC_DIMENSION_BLOCKED": "🚫 <b>{dimension}：访问已暂停</b>\n\n已使用 {used:.1f} GB，共 {limit} GB。\n\n该线路的访问已关闭，其他线路照常可用。如需恢复访问，请在订阅页面加购流量，或等待下一个计费周期开始。",
+  "TRAFFIC_DIMENSION_RESTORED": "✅ <b>{dimension}：访问已恢复</b>\n\n额度再次可用：{limit} GB。",
+  "TRAFFIC_PACKAGE_UNAVAILABLE": "⚠️ 该套餐已不再提供"
 }

@@ -421,7 +421,7 @@ class DailySubscriptionService:
             'errors': 0,
         }
 
-        from app.database.models import TrafficPurchase
+        from app.database.models import BASE_TRAFFIC_DIMENSION_KEY, TrafficPurchase
 
         try:
             async with AsyncSessionLocal() as db:
@@ -433,9 +433,16 @@ class DailySubscriptionService:
                     expired_purchases = result.scalars().all()
                     stats['checked'] = len(expired_purchases)
 
-                    # Группируем по подпискам для обновления
+                    # Группируем по подпискам для обновления. Докупки измерений
+                    # обрабатываются отдельно: у них своя строка состояния, и
+                    # общая математика базового лимита их не касается — иначе
+                    # истёкший пакет измерения ронял бы обычный лимит подписки.
                     subscriptions_to_update = {}
+                    dimension_subscription_ids = set()
                     for purchase in expired_purchases:
+                        if (purchase.dimension or BASE_TRAFFIC_DIMENSION_KEY) != BASE_TRAFFIC_DIMENSION_KEY:
+                            dimension_subscription_ids.add(purchase.subscription_id)
+                            continue
                         if purchase.subscription_id not in subscriptions_to_update:
                             subscriptions_to_update[purchase.subscription_id] = []
                         subscriptions_to_update[purchase.subscription_id].append(purchase)
@@ -453,6 +460,10 @@ class DailySubscriptionService:
                                 exc_info=True,
                             )
                             stats['errors'] += 1
+
+                    stats['reset'] += await self._reset_dimension_purchases(
+                        db, dimension_subscription_ids, now=now, stats=stats
+                    )
                 except Exception as e:
                     logger.error('Ошибка при обработке сброса трафика', error=e, exc_info=True)
                     await db.rollback()
@@ -461,6 +472,39 @@ class DailySubscriptionService:
             logger.error('Ошибка при получении подписок для сброса трафика', error=e, exc_info=True)
 
         return stats
+
+    async def _reset_dimension_purchases(
+        self,
+        db: AsyncSession,
+        subscription_ids: set,
+        *,
+        now,
+        stats: dict,
+    ) -> int:
+        """Приводит квоты измерений к живым докупкам после истечения пакетов."""
+        if not subscription_ids:
+            return 0
+
+        from app.database.crud.subscription import get_subscription_by_id
+        from app.services.traffic_dimensions import expire_dimension_purchases
+
+        changed = 0
+        for subscription_id in subscription_ids:
+            try:
+                subscription = await get_subscription_by_id(db, subscription_id)
+                if subscription is None:
+                    continue
+                changed += await expire_dimension_purchases(db, subscription, now=now)
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                stats['errors'] += 1
+                logger.error(
+                    'Ошибка сброса докупок измерения трафика',
+                    subscription_id=subscription_id,
+                    error=e,
+                )
+        return changed
 
     async def _reset_subscription_traffic(self, db: AsyncSession, subscription_id: int, expired_purchases: list):
         """Сбрасывает истекшие докупки трафика у подписки."""

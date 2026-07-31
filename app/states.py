@@ -141,7 +141,13 @@ class AdminStates(StatesGroup):
     editing_device_price = State()
     editing_user_devices = State()
     editing_user_traffic = State()
-    editing_user_wl_traffic = State()
+    editing_user_dimension_traffic = State()
+
+    # Админка измерений трафика
+    creating_traffic_dimension = State()
+    editing_traffic_dimension_limit = State()
+    editing_traffic_dimension_title = State()
+    editing_traffic_dimension_icon = State()
     editing_user_referrals = State()
     editing_user_referral_percent = State()
 
@@ -218,6 +224,7 @@ class AdminStates(StatesGroup):
     editing_tariff_squads = State()
     editing_tariff_promo_groups = State()
     editing_tariff_traffic_topup_packages = State()
+    editing_tariff_dimension_included = State()
     editing_tariff_max_topup_traffic = State()
     editing_tariff_custom_traffic_price = State()
     editing_tariff_custom_traffic_min = State()

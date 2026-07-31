@@ -118,12 +118,31 @@ class TrafficPackageResponse(BaseModel):
     discount_percent: int = 0
     base_price_kopeks: int | None = None
     discount_kopeks: int | None = None
+    # Пакет может начислять несколько измерений трафика сразу, и тогда одного
+    # числа `gb` для его описания не хватает. Поля ниже добавлены, а не
+    # заменяют старые: клиенты, читающие только `gb`/`price_kopeks`, продолжают
+    # работать, а `gb` для такого пакета равен суммарному объёму.
+    id: str | None = None
+    title: str | None = None
+    grants: list['TrafficGrantResponse'] = []
+
+
+class TrafficGrantResponse(BaseModel):
+    """Одно начисление пакета: сколько ГБ и какому измерению."""
+
+    dimension: str
+    label: str
+    gb: int
+    is_base: bool = False
 
 
 class TrafficPurchaseRequest(BaseModel):
     """Request to purchase additional traffic."""
 
-    gb: int = Field(..., ge=0, le=100_000, description='GB to purchase (0 = unlimited)')
+    gb: int = Field(0, ge=0, le=100_000, description='GB to purchase (0 = unlimited)')
+    # Пакет с начислениями по измерениям адресуется идентификатором: числом ГБ
+    # его не выразить. Когда задан, `gb` игнорируется.
+    package_id: str | None = Field(None, max_length=64, description='Traffic package id (multi-dimension packages)')
     # See PurchasePreviewRequest.yandex_cid (#558449).
     yandex_cid: str | None = Field(
         None,
@@ -237,3 +256,6 @@ class TariffPurchaseRequest(BaseModel):
         pattern=r'^[A-Za-z0-9._:-]{4,128}$',
         description='Cached Yandex.Metrika ClientID (optional).',
     )
+
+
+TrafficPackageResponse.model_rebuild()

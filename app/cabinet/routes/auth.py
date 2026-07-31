@@ -38,6 +38,7 @@ from app.services.rbac_bootstrap_service import (
     is_user_admin_by_env,
 )
 from app.services.referral_service import process_referral_registration
+from app.services.traffic_dimension_enforcement import dimension_squad_policy, merge_panel_squads
 from app.services.web_auth_service import (
     WEB_AUTH_TOKEN_TTL,
     consume_web_auth_token,
@@ -508,7 +509,14 @@ async def _sync_subscription_from_panel_by_email(db: AsyncSession, user: User) -
                     existing_sub.remnawave_short_uuid = panel_user.short_uuid
                     existing_sub.subscription_url = panel_user.subscription_url
                     existing_sub.subscription_crypto_link = panel_user.happ_crypto_link
-                    existing_sub.connected_squads = connected_squads
+                    # Снятые из-за исчерпанного измерения сквады отсутствуют в
+                    # панели намеренно — возвращаем их в право подписки, иначе
+                    # блокировка стёрла бы оплаченное направление насовсем.
+                    existing_sub.connected_squads = merge_panel_squads(
+                        connected_squads,
+                        existing_sub.connected_squads,
+                        dimension_squad_policy.stripped_for(panel_user.uuid or ''),
+                    )
                     existing_sub.device_limit = device_limit
                     existing_sub.is_trial = False
                     logger.info(

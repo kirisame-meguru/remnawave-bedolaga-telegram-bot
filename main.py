@@ -40,6 +40,9 @@ from app.services.remnawave_sync_service import remnawave_sync_service
 from app.services.reporting_service import reporting_service
 from app.services.riopay_service import riopay_service
 from app.services.system_settings_service import bot_configuration_service
+from app.services.traffic_dimension_ledger import traffic_dimension_ledger_scheduler
+from app.services.traffic_dimension_notifier import install_notifier as install_dimension_notifier
+from app.services.traffic_dimension_reconciler import restore_policy_on_startup
 from app.services.traffic_monitoring_service import traffic_monitoring_scheduler
 from app.services.version_service import version_service
 from app.services.web_api_token_service import ensure_default_web_api_token
@@ -320,6 +323,9 @@ async def main():
         traffic_monitoring_scheduler.set_bot(bot)
         daily_subscription_service.set_bot(bot)
         telegram_notifier.set_bot(bot)
+        # Реконсилятор измерений сам про Telegram ничего не знает: уведомителя
+        # ему подключают снаружи, здесь.
+        install_dimension_notifier(bot)
 
         from app.services.channel_subscription_service import channel_subscription_service
 
@@ -672,6 +678,28 @@ async def main():
                 stage.skip('Мониторинг трафика отключен настройками')
 
         async with timeline.stage(
+            'Журнал измерений трафика',
+            '📐',
+            success_message='Журнал измерений трафика запущен',
+        ) as stage:
+            # Карта блокировок поднимается ПЕРВОЙ и до любых записей в панель:
+            # без неё первое же постороннее обновление вернуло бы снятые сквады
+            # заблокированным подпискам.
+            restored = await restore_policy_on_startup()
+            if restored:
+                stage.log(f'Восстановлено блокировок измерений: {restored}')
+
+            # Отдельный цикл, а не хвост мониторинга трафика: тот отключаемый,
+            # а журнал — источник цифр для блокировок измерений. Без заведённых
+            # измерений цикл не делает ни одного запроса к панели.
+            await traffic_dimension_ledger_scheduler.start()
+            stage.log(
+                f'Интервал снятия: {settings.TRAFFIC_DIMENSION_SAMPLE_INTERVAL_MINUTES} мин, '
+                f'хранение наблюдений: {settings.TRAFFIC_DIMENSION_SAMPLE_RETENTION_DAYS} дн'
+            )
+            stage.log(f'Режим ограничений: {settings.TRAFFIC_DIMENSION_ENFORCEMENT_MODE}')
+
+        async with timeline.stage(
             'Суточные подписки',
             '💳',
             success_message='Сервис суточных подписок запущен',
@@ -896,6 +924,12 @@ async def main():
                 await traffic_monitoring_task
             except asyncio.CancelledError:
                 pass
+
+        logger.info('ℹ️ Остановка журнала измерений трафика...')
+        try:
+            await traffic_dimension_ledger_scheduler.stop()
+        except Exception as e:
+            logger.error('Ошибка остановки журнала измерений трафика', error=e)
 
         if daily_subscription_task and not daily_subscription_task.done():
             logger.info('ℹ️ Остановка сервиса суточных подписок...')

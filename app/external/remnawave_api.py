@@ -15,6 +15,7 @@ from Crypto.Cipher import PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
 from app.config import settings
+from app.services.traffic_dimension_enforcement import dimension_squad_policy
 
 
 logger = structlog.get_logger(__name__)
@@ -708,7 +709,11 @@ class RemnaWaveAPI:
         if tag is not None:
             data['tag'] = tag
         if active_internal_squads is not None:
-            data['activeInternalSquads'] = active_internal_squads
+            # Фильтр блокировки измерений стоит именно здесь: исходящих
+            # обновлений панели два десятка, и каждое обязано соблюдать снятие
+            # сквадов, даже если про измерения трафика ничего не знает.
+            # Без него первая же посторонняя запись вернула бы доступ.
+            data['activeInternalSquads'] = dimension_squad_policy.filter_squads(uuid, active_internal_squads)
         if external_squad_uuid is not ...:
             data['externalSquadUuid'] = external_squad_uuid
 

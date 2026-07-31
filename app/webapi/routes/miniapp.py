@@ -3572,7 +3572,8 @@ async def get_subscription_details(
 
 async def _get_current_tariff_model(db: AsyncSession, subscription, user=None) -> MiniAppCurrentTariff | None:
     """Возвращает модель текущего тарифа пользователя."""
-    from app.webapi.schemas.miniapp import MiniAppTrafficTopupPackage
+    from app.services.traffic_dimensions import traffic_dimensions
+    from app.webapi.schemas.miniapp import MiniAppTrafficGrant, MiniAppTrafficTopupPackage
 
     if not subscription or not getattr(subscription, 'tariff_id', None):
         return None
@@ -3598,41 +3599,63 @@ async def _get_current_tariff_model(db: AsyncSession, subscription, user=None) -
         available_topup_gb = max(0, max_topup_traffic_gb - current_subscription_traffic)
 
     # Пакеты докупки трафика
-    traffic_topup_enabled = getattr(tariff, 'traffic_topup_enabled', False) and tariff.traffic_limit_gb > 0
+    # Безлимитный обычный трафик не отключает докупку целиком: измерения
+    # остаются лимитированными и пополняются своими пакетами.
+    dimension_specs = await traffic_dimensions.non_base(db)
+    traffic_topup_enabled = getattr(tariff, 'traffic_topup_enabled', False) and (
+        tariff.traffic_limit_gb > 0 or bool(dimension_specs)
+    )
     traffic_topup_packages = []
 
-    if traffic_topup_enabled and hasattr(tariff, 'get_traffic_topup_packages'):
-        packages = tariff.get_traffic_topup_packages()
-        for gb in sorted(packages.keys()):
-            # Фильтруем пакеты, которые превышают доступный лимит
-            if available_topup_gb is not None and gb > available_topup_gb:
+    if traffic_topup_enabled:
+        labels = {spec.key: spec.label(getattr(user, 'language', None)) for spec in dimension_specs}
+        for package in tariff.get_purchasable_traffic_packages():
+            base_gb = sum(grant.gb for grant in package.grants if grant.is_base)
+            # Лимит докупки ограничивает только обычный трафик — квоты
+            # измерений считаются отдельно и под него не попадают.
+            if available_topup_gb is not None and base_gb > available_topup_gb:
                 continue
 
-            base_price = packages[gb]
-            # Применяем скидку через PricingEngine
+            base_price = package.price_kopeks
             discounted_price, _discount_val, traffic_discount_pct = pricing_engine.calculate_traffic_discount(
                 base_price,
                 user,
             )
+            grants = [
+                MiniAppTrafficGrant(
+                    dimension=grant.dimension,
+                    label=labels.get(grant.dimension, grant.dimension),
+                    gb=grant.gb,
+                    is_base=grant.is_base,
+                )
+                for grant in package.grants
+            ]
             if traffic_discount_pct > 0:
                 traffic_topup_packages.append(
                     MiniAppTrafficTopupPackage(
-                        gb=gb,
+                        gb=package.total_gb,
                         price_kopeks=discounted_price,
                         price_label=settings.format_price(discounted_price),
                         original_price_kopeks=base_price,
                         original_price_label=settings.format_price(base_price),
                         discount_percent=traffic_discount_pct,
+                        id=package.id,
+                        title=package.title or None,
+                        grants=grants,
                     )
                 )
             else:
                 traffic_topup_packages.append(
                     MiniAppTrafficTopupPackage(
-                        gb=gb,
+                        gb=package.total_gb,
                         price_kopeks=base_price,
                         price_label=settings.format_price(base_price),
+                        id=package.id,
+                        title=package.title or None,
+                        grants=grants,
                     )
                 )
+        traffic_topup_packages.sort(key=lambda item: (item.price_kopeks, item.gb))
 
     # Если нет доступных пакетов из-за лимита - отключаем докупку
     if traffic_topup_enabled and not traffic_topup_packages and available_topup_gb == 0:
@@ -7201,6 +7224,71 @@ async def switch_tariff_endpoint(
     )
 
 
+async def _purchase_traffic_package_miniapp(db: AsyncSession, user, subscription, package_id: str):
+    """Покупка пакета трафика из мини-аппа.
+
+    Та же последовательность, что в боте и кабинете: цена пересчитывается из
+    тарифа, списание идёт до начисления, синхронизация панели — после коммита.
+    """
+    from app.database.crud.tariff import get_tariff_by_id
+    from app.database.crud.transaction import create_transaction
+    from app.database.crud.user import subtract_user_balance
+    from app.database.models import TransactionType
+    from app.services.traffic_package_service import apply_traffic_package
+    from app.services.traffic_packages import package_by_id
+    from app.webapi.schemas.miniapp import MiniAppTrafficTopupResponse
+
+    tariff = await get_tariff_by_id(db, subscription.tariff_id) if subscription.tariff_id else None
+    package = package_by_id(tariff.get_purchasable_traffic_packages(), package_id) if tariff else None
+    if package is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={'code': 'package_not_found', 'message': 'Traffic package not found'},
+        )
+
+    price_kopeks, _discount_value, _percent = PricingEngine.calculate_traffic_discount(package.price_kopeks, user)
+
+    if price_kopeks > 0 and user.balance_kopeks < price_kopeks:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={'code': 'insufficient_balance', 'message': 'Insufficient balance'},
+        )
+
+    if price_kopeks > 0:
+        charged = await subtract_user_balance(db, user, price_kopeks, f'Пакет трафика {package.id}')
+        if not charged:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={'code': 'balance_error', 'message': 'Failed to subtract balance'},
+            )
+
+    application = await apply_traffic_package(db, subscription, package, price_kopeks=price_kopeks)
+    await create_transaction(
+        db=db,
+        user_id=user.id,
+        type=TransactionType.SUBSCRIPTION_PAYMENT,
+        amount_kopeks=price_kopeks,
+        description=f'Пакет трафика ({application.describe()})',
+    )
+    await db.commit()
+    await db.refresh(subscription)
+
+    try:
+        service = SubscriptionService()
+        await service.update_remnawave_user(db, subscription)
+    except Exception as error:
+        # Оплачено и начислено: недоступная панель не повод отдать ошибку.
+        logger.warning('Panel sync after miniapp traffic package purchase failed', error=error)
+
+    return MiniAppTrafficTopupResponse(
+        success=True,
+        message=f'Пакет активирован: {application.describe()}',
+        new_traffic_limit_gb=subscription.traffic_limit_gb or 0,
+        new_balance_kopeks=user.balance_kopeks,
+        charged_kopeks=price_kopeks,
+    )
+
+
 @router.post('/subscription/traffic-topup')
 async def purchase_traffic_topup_endpoint(
     payload: MiniAppTrafficTopupRequest,
@@ -7217,6 +7305,11 @@ async def purchase_traffic_topup_endpoint(
     user = await _authorize_miniapp_user(payload.init_data, db)
     subscription = _ensure_paid_subscription(user, subscription_id=payload.subscription_id)
     _validate_subscription_id(payload.subscription_id, subscription)
+
+    if payload.package_id:
+        # Пакет с начислениями по измерениям идёт своим путём: ветка ниже
+        # оперирует одним числом ГБ и такой пакет описать не может.
+        return await _purchase_traffic_package_miniapp(db, user, subscription, payload.package_id)
 
     # Проверяем режим тарифов
     if not settings.is_tariffs_mode():

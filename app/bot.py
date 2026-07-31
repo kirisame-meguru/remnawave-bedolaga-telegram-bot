@@ -56,6 +56,8 @@ from app.handlers.admin import (
     system_logs as admin_system_logs,
     tariffs as admin_tariffs,
     tickets as admin_tickets,
+    traffic_dimensions as admin_traffic_dimensions,
+    traffic_why as admin_traffic_why,
     trials as admin_trials,
     updates as admin_updates,
     user_messages as admin_user_messages,
@@ -223,6 +225,8 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     admin_payments.register_handlers(dp)
     admin_trials.register_handlers(dp)
     admin_tariffs.register_handlers(dp)
+    admin_traffic_dimensions.register_handlers(dp)
+    admin_traffic_why.register_handlers(dp)
     admin_bulk_ban.register_bulk_ban_handlers(dp)
     admin_blacklist.register_blacklist_handlers(dp)
     admin_blocked_users.register_handlers(dp)

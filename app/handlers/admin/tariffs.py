@@ -192,6 +192,11 @@ def get_tariff_view_keyboard(
     )
     buttons.append(
         [
+            InlineKeyboardButton(text='📐 Измерения трафика', callback_data=f'admin_tariff_dims:{tariff.id}'),
+        ]
+    )
+    buttons.append(
+        [
             InlineKeyboardButton(text='🔄 Сброс трафика', callback_data=f'admin_tariff_edit_reset_mode:{tariff.id}'),
         ]
     )
@@ -260,15 +265,18 @@ def _format_traffic_topup_packages(tariff: Tariff) -> str:
     if not getattr(tariff, 'traffic_topup_enabled', False):
         return '❌ Отключено'
 
-    packages = tariff.get_traffic_topup_packages() if hasattr(tariff, 'get_traffic_topup_packages') else {}
+    from app.services.traffic_packages import describe_package
+
+    packages = tariff.get_traffic_packages()
     if not packages:
         return '✅ Включено, но пакеты не настроены'
 
+    # Без заголовков измерений: обзор синхронный и до БД не ходит, ключ
+    # измерения администратору всё равно понятен.
     lines = ['✅ Включено']
-    for gb in sorted(packages.keys()):
-        price = packages[gb]
-        lines.append(f'  • {gb} ГБ: {format_price_kopeks(price)}')
-
+    lines.extend(
+        f'  • {describe_package(package)}: {format_price_kopeks(package.price_kopeks)}' for package in packages
+    )
     return '\n'.join(lines)
 
 
@@ -1704,44 +1712,48 @@ async def process_edit_tariff_trial_days(
 # ============ РЕДАКТИРОВАНИЕ ДОКУПКИ ТРАФИКА ============
 
 
-def _parse_traffic_topup_packages(text: str) -> dict[int, int]:
+def _parse_traffic_topup_packages(text: str) -> list[dict]:
+    """Разбирает строку с пакетами докупки в дескрипторы.
+
+    Формат расширяет прежний, а не заменяет: «5:5000» по-прежнему значит
+    «5 ГБ обычного трафика за 50 ₽». Начисление по измерению пишется как
+    «ключ=ГБ», несколько начислений в одном пакете — через «+»:
+
+        5:5000          обычный трафик
+        wl=10:9900      только измерение
+        5+wl=3:12000    смесь по одной цене
     """
-    Парсит строку с пакетами докупки трафика.
-    Формат: "5:5000, 10:9000, 20:15000" (ГБ:цена_в_копейках)
-    """
-    packages = {}
-    text = text.replace(';', ',').replace('=', ':')
+    from app.services.traffic_packages import parse_package_spec
 
-    for part in text.split(','):
-        part = part.strip()
-        if not part:
-            continue
-
-        if ':' not in part:
-            continue
-
-        gb_str, price_str = part.split(':', 1)
-        try:
-            gb = int(gb_str.strip())
-            price = int(price_str.strip())
-            if gb > 0 and price > 0:
-                packages[gb] = price
-        except ValueError:
-            continue
-
-    return packages
+    return parse_package_spec(text)
 
 
-def _format_traffic_topup_packages_for_edit(packages: dict[int, int]) -> str:
-    """Форматирует пакеты докупки для редактирования."""
+async def _dimension_labels_for_admin(db: AsyncSession, language: str) -> dict[str, str]:
+    """Заголовки измерений задаёт администратор — читаем их из реестра."""
+    from app.services.traffic_dimensions import traffic_dimensions
+
+    return {spec.key: spec.label(language) for spec in await traffic_dimensions.enabled(db)}
+
+
+def _format_traffic_topup_packages_for_edit(tariff: Tariff) -> str:
+    """Текущие пакеты в том же виде, в каком их вводят."""
+    from app.services.traffic_packages import format_package_spec
+
+    packages = tariff.get_traffic_packages()
     if not packages:
-        return '5:5000, 10:9000, 20:15000'
+        return '5:5000, 10:9000, wl=5:4900'
+    return format_package_spec(packages)
 
-    parts = []
-    for gb in sorted(packages.keys()):
-        parts.append(f'{gb}:{packages[gb]}')
 
-    return ', '.join(parts)
+def _describe_packages(tariff: Tariff, labels: dict[str, str]) -> str:
+    from app.services.traffic_packages import describe_package
+
+    packages = tariff.get_traffic_packages()
+    if not packages:
+        return '  Не настроены'
+    return '\n'.join(
+        f'  • {describe_package(package, labels)}: {format_price_kopeks(package.price_kopeks)}' for package in packages
+    )
 
 
 @admin_required
@@ -1761,23 +1773,23 @@ async def start_edit_tariff_traffic_topup(
         await callback.answer('Тариф не найден', show_alert=True)
         return
 
-    # Проверяем, безлимитный ли тариф
-    if tariff.is_unlimited_traffic:
+    labels = await _dimension_labels_for_admin(db, db_user.language)
+    has_dimensions = any(key != 'base' for key in labels)
+
+    # Безлимитный обычный трафик докупать нечего — но измерения при этом
+    # остаются лимитированными, и продавать пакеты по ним по-прежнему нужно.
+    if tariff.is_unlimited_traffic and not has_dimensions:
         await callback.answer('Докупка недоступна для безлимитного тарифа', show_alert=True)
         return
 
     is_enabled = getattr(tariff, 'traffic_topup_enabled', False)
-    packages = tariff.get_traffic_topup_packages() if hasattr(tariff, 'get_traffic_topup_packages') else {}
     max_topup_traffic = getattr(tariff, 'max_topup_traffic_gb', 0) or 0
 
     # Форматируем текущие настройки
     if is_enabled:
         status = '✅ Включено'
-        if packages:
-            packages_display = '\n'.join(
-                f'  • {gb} ГБ: {format_price_kopeks(price)}' for gb, price in sorted(packages.items())
-            )
-        else:
+        packages_display = _describe_packages(tariff, labels)
+        if not tariff.get_traffic_packages():
             packages_display = '  Пакеты не настроены'
     else:
         status = '❌ Отключено'
@@ -1857,16 +1869,12 @@ async def toggle_tariff_traffic_topup(
 
     # Перерисовываем меню
     texts = get_texts(db_user.language)
-    packages = tariff.get_traffic_topup_packages() if hasattr(tariff, 'get_traffic_topup_packages') else {}
     max_topup_traffic = getattr(tariff, 'max_topup_traffic_gb', 0) or 0
 
     if new_value:
         status = '✅ Включено'
-        if packages:
-            packages_display = '\n'.join(
-                f'  • {gb} ГБ: {format_price_kopeks(price)}' for gb, price in sorted(packages.items())
-            )
-        else:
+        packages_display = _describe_packages(tariff, await _dimension_labels_for_admin(db, db_user.language))
+        if not tariff.get_traffic_packages():
             packages_display = '  Пакеты не настроены'
     else:
         status = '❌ Отключено'
@@ -1939,24 +1947,32 @@ async def start_edit_traffic_topup_packages(
     await state.set_state(AdminStates.editing_tariff_traffic_topup_packages)
     await state.update_data(tariff_id=tariff_id, language=db_user.language)
 
-    packages = tariff.get_traffic_topup_packages() if hasattr(tariff, 'get_traffic_topup_packages') else {}
-    current_packages = _format_traffic_topup_packages_for_edit(packages)
+    labels = await _dimension_labels_for_admin(db, db_user.language)
+    current_packages = _format_traffic_topup_packages_for_edit(tariff)
+    packages_display = _describe_packages(tariff, labels)
 
-    if packages:
-        packages_display = '\n'.join(
-            f'  • {gb} ГБ: {format_price_kopeks(price)}' for gb, price in sorted(packages.items())
+    if labels_hint := ', '.join(f'<code>{key}</code> — {label}' for key, label in labels.items() if key != 'base'):
+        dimension_hint = (
+            '\n<b>Доступные измерения:</b>\n'
+            f'{labels_hint}\n\n'
+            'Начисление по измерению: <code>ключ=ГБ</code>, несколько — через <code>+</code>.\n'
+            'Примеры:\n'
+            '<code>10:8900</code> — 10 ГБ обычного трафика\n'
+            '<code>wl=5:4900</code> — 5 ГБ только по измерению\n'
+            '<code>10+wl=5:12900</code> — и то, и другое за одну цену\n'
         )
     else:
-        packages_display = '  Не настроены'
+        dimension_hint = (
+            '\n(ГБ:цена_в_копейках, через запятую)\nНапример: <code>5:5000, 10:9000</code> = 5ГБ за 50₽, 10ГБ за 90₽\n'
+        )
 
     await callback.message.edit_text(
         f'📦 <b>Настройка пакетов докупки трафика</b>\n\n'
         f'Тариф: <b>{html.escape(tariff.name)}</b>\n\n'
         f'<b>Текущие пакеты:</b>\n{packages_display}\n\n'
         'Введите пакеты в формате:\n'
-        f'<code>{current_packages}</code>\n\n'
-        '(ГБ:цена_в_копейках, через запятую)\n'
-        'Например: <code>5:5000, 10:9000</code> = 5ГБ за 50₽, 10ГБ за 90₽',
+        f'<code>{current_packages}</code>\n'
+        f'{dimension_hint}',
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=texts.CANCEL, callback_data=f'admin_tariff_edit_traffic_topup:{tariff_id}')]
@@ -1994,26 +2010,25 @@ async def process_edit_traffic_topup_packages(
         )
         return
 
-    packages = _parse_traffic_topup_packages(message.text.strip())
+    descriptors = _parse_traffic_topup_packages(message.text.strip())
 
-    if not packages:
+    if not descriptors:
         await message.answer(
             'Не удалось распознать пакеты.\n\n'
             'Формат: <code>ГБ:цена_в_копейках</code>\n'
-            'Пример: <code>5:5000, 10:9000, 20:15000</code>',
+            'Измерение: <code>ключ=ГБ:цена</code>, смесь: <code>ГБ+ключ=ГБ:цена</code>\n'
+            'Пример: <code>5:5000, wl=10:9900, 5+wl=3:12000</code>',
             parse_mode='HTML',
         )
         return
 
-    # Преобразуем в формат для JSON (строковые ключи)
-    packages_json = {str(gb): price for gb, price in packages.items()}
-
-    tariff = await update_tariff(db, tariff, traffic_topup_packages=packages_json)
+    # Дескрипторы храним списком: словарь «ГБ → цена» не описывает пакет,
+    # начисляющий сразу несколько измерений.
+    tariff = await update_tariff(db, tariff, traffic_topup_packages=descriptors)
     await state.clear()
 
-    # Показываем обновленное меню
     texts = get_texts(db_user.language)
-    packages_display = '\n'.join(f'  • {gb} ГБ: {format_price_kopeks(price)}' for gb, price in sorted(packages.items()))
+    packages_display = _describe_packages(tariff, await _dimension_labels_for_admin(db, db_user.language))
     max_topup_traffic = getattr(tariff, 'max_topup_traffic_gb', 0) or 0
     max_limit_display = f'{max_topup_traffic} ГБ' if max_topup_traffic > 0 else 'Без ограничений'
 
@@ -2124,12 +2139,8 @@ async def process_edit_max_topup_traffic(
     await state.clear()
 
     # Показываем обновленное меню
-    packages = tariff.get_traffic_topup_packages() if hasattr(tariff, 'get_traffic_topup_packages') else {}
-    if packages:
-        packages_display = '\n'.join(
-            f'  • {gb} ГБ: {format_price_kopeks(price)}' for gb, price in sorted(packages.items())
-        )
-    else:
+    packages_display = _describe_packages(tariff, await _dimension_labels_for_admin(db, db_user.language))
+    if not tariff.get_traffic_packages():
         packages_display = '  Пакеты не настроены'
 
     max_limit_display = f'{new_limit} ГБ' if new_limit > 0 else 'Без ограничений'
@@ -2840,10 +2851,202 @@ async def set_traffic_reset_mode(
     )
 
 
+# ============ ИЗМЕРЕНИЯ ТРАФИКА, ВКЛЮЧЁННЫЕ В ТАРИФ ============
+
+
+async def _tariff_dimension_screen(db: AsyncSession, tariff: Tariff, language: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран «что из измерений входит в тариф и в каком объёме»."""
+    from app.services.traffic_dimensions import load_tariff_dimension_config, traffic_dimensions
+
+    texts = get_texts(language)
+    specs = await traffic_dimensions.non_base(db)
+    config = await load_tariff_dimension_config(db, tariff.id)
+
+    if not specs:
+        text = (
+            f'📐 <b>Измерения трафика в тарифе</b>\n\n'
+            f'Тариф: <b>{html.escape(tariff.name)}</b>\n\n'
+            'Ни одного измерения не заведено.\n'
+            'Создайте их в разделе «Настройки → Измерения трафика».'
+        )
+        return text, InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff.id}')]]
+        )
+
+    lines = []
+    buttons = []
+    for spec in specs:
+        row = config.get(spec.id)
+        if row is None:
+            value = '— не входит в тариф'
+        elif not row.included_gb:
+            value = '♾️ безлимит'
+        else:
+            value = f'{row.included_gb} ГБ'
+        lines.append(f'  • {spec.label(language)}: {value}')
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f'✏️ {spec.label(language)}',
+                    callback_data=f'admin_tariff_dim:{tariff.id}:{spec.id}',
+                )
+            ]
+        )
+
+    buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff.id}')])
+    text = (
+        f'📐 <b>Измерения трафика в тарифе</b>\n\n'
+        f'Тариф: <b>{html.escape(tariff.name)}</b>\n\n'
+        f'<b>Включено в тариф:</b>\n' + '\n'.join(lines) + '\n\n'
+        'Объём сбрасывается вместе с обычным трафиком — по расчётному окну тарифа.\n'
+        'Докупленные пакеты живут отдельно и продление переживают.'
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@admin_required
+@error_handler
+async def show_tariff_dimensions(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    """Список измерений тарифа с включёнными объёмами."""
+    tariff_id = int(callback.data.split(':')[1])
+    tariff = await get_tariff_by_id(db, tariff_id)
+    if not tariff:
+        await callback.answer('Тариф не найден', show_alert=True)
+        return
+
+    text, keyboard = await _tariff_dimension_screen(db, tariff, db_user.language)
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode='HTML')
+    await callback.answer()
+
+
+@admin_required
+@error_handler
+async def start_edit_tariff_dimension(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    """Запрашивает объём измерения, включённый в тариф."""
+    from app.services.traffic_dimensions import load_tariff_dimension_config, traffic_dimensions
+
+    _, tariff_id_raw, dimension_id_raw = callback.data.split(':')
+    tariff_id, dimension_id = int(tariff_id_raw), int(dimension_id_raw)
+
+    tariff = await get_tariff_by_id(db, tariff_id)
+    spec = next((s for s in await traffic_dimensions.non_base(db) if s.id == dimension_id), None)
+    if not tariff or spec is None:
+        await callback.answer('Не найдено', show_alert=True)
+        return
+
+    config = await load_tariff_dimension_config(db, tariff_id)
+    row = config.get(dimension_id)
+    current = 'не входит в тариф' if row is None else (f'{row.included_gb} ГБ' if row.included_gb else 'безлимит')
+
+    await state.set_state(AdminStates.editing_tariff_dimension_included)
+    await state.update_data(tariff_id=tariff_id, dimension_id=dimension_id, language=db_user.language)
+
+    texts = get_texts(db_user.language)
+    await callback.message.edit_text(
+        f'📐 <b>{spec.label(db_user.language)}</b>\n\n'
+        f'Тариф: <b>{html.escape(tariff.name)}</b>\n'
+        f'Сейчас: {current}\n\n'
+        'Введите объём в ГБ:\n'
+        '• <code>50</code> — 50 ГБ включено в тариф\n'
+        '• <code>0</code> — включено без ограничения\n'
+        '• <code>-</code> — измерение в тариф не входит\n\n'
+        'Изменение применится ко всем подпискам тарифа в ближайшем цикле.',
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=texts.CANCEL, callback_data=f'admin_tariff_dims:{tariff_id}')]]
+        ),
+        parse_mode='HTML',
+    )
+    await callback.answer()
+
+
+@admin_required
+@error_handler
+async def process_edit_tariff_dimension(
+    message: types.Message,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    """Сохраняет включённый объём измерения для тарифа."""
+    from sqlalchemy import delete as sql_delete
+
+    from app.database.models import TariffTrafficDimension
+
+    data = await state.get_data()
+    tariff_id = data.get('tariff_id')
+    dimension_id = data.get('dimension_id')
+
+    tariff = await get_tariff_by_id(db, tariff_id)
+    if not tariff:
+        await message.answer('Тариф не найден')
+        await state.clear()
+        return
+
+    raw = (message.text or '').strip()
+    if raw in {'-', '—', 'нет', 'no'}:
+        included = None
+    else:
+        try:
+            included = int(raw)
+        except ValueError:
+            await message.answer(
+                'Введите целое число ГБ, <code>0</code> для безлимита или <code>-</code>, '
+                'чтобы измерение не входило в тариф.',
+                parse_mode='HTML',
+            )
+            return
+        if included < 0:
+            await message.answer('Объём не может быть отрицательным.')
+            return
+
+    if included is None:
+        # Отсутствие строки и означает «тариф это измерение не включает».
+        await db.execute(
+            sql_delete(TariffTrafficDimension).where(
+                TariffTrafficDimension.tariff_id == tariff_id,
+                TariffTrafficDimension.dimension_id == dimension_id,
+            )
+        )
+    else:
+        config = await db.execute(
+            select(TariffTrafficDimension).where(
+                TariffTrafficDimension.tariff_id == tariff_id,
+                TariffTrafficDimension.dimension_id == dimension_id,
+            )
+        )
+        row = config.scalar_one_or_none()
+        if row is None:
+            row = TariffTrafficDimension(tariff_id=tariff_id, dimension_id=dimension_id, included_gb=included)
+            db.add(row)
+        else:
+            row.included_gb = included
+    await db.commit()
+
+    await state.clear()
+    text, keyboard = await _tariff_dimension_screen(db, tariff, db_user.language)
+    await message.answer(f'✅ Сохранено.\n\n{text}', reply_markup=keyboard, parse_mode='HTML')
+
+
 def register_handlers(dp: Dispatcher):
     """Регистрирует обработчики для управления тарифами."""
     # Произвольный трафик регистрируется до общего toggle-фильтра.
     register_custom_traffic_handlers(dp)
+
+    # Измерения тарифа. Порядок важен: 'admin_tariff_dim:' — префикс
+    # 'admin_tariff_dims:', поэтому более длинный регистрируется первым.
+    dp.callback_query.register(show_tariff_dimensions, F.data.startswith('admin_tariff_dims:'))
+    dp.callback_query.register(start_edit_tariff_dimension, F.data.startswith('admin_tariff_dim:'))
+    dp.message.register(process_edit_tariff_dimension, AdminStates.editing_tariff_dimension_included)
 
     # Список тарифов
     dp.callback_query.register(show_tariffs_list, F.data == 'admin_tariffs')

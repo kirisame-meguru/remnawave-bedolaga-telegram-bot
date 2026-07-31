@@ -219,13 +219,38 @@ class Settings(BaseSettings):
     REMNAWAVE_AUTO_SYNC_TIMES: str = '03:00'
     CABINET_REMNA_SUB_CONFIG: str | None = None  # UUID конфига страницы подписки из RemnaWave
 
-    # WL (WhiteList / БС) трафик — отдельный счётчик трафика по выбранным инбаундам.
-    # Требует панель RemnaWave с пер-инбаунд учётом трафика на пользователя
-    # (инбаунды с trackTrafficPerUser). Трафик по всем WL-инбаундам суммируется
-    # в один счётчик и показывается строкой «WL Трафик (БС)» рядом с обычным трафиком.
-    WL_TRAFFIC_ENABLED: bool = False
-    WL_INBOUND_UUIDS: str = ''  # список UUID инбаундов через запятую (редактируется через пикер)
-    WL_TRAFFIC_DEFAULT_LIMIT_GB: int = 0  # 0 = безлимит; значение по умолчанию для новых подписок
+    # День недели (0 = понедельник), когда панель делает TRUNCATE пер-инбаунд истории
+    # (джоба CLEAN_OLD_USAGE_RECORDS, понедельник 00:30 UTC). Всё, что старше текущей
+    # панельной недели, панель уже не отдаст, поэтому окно запроса подрезается до этой
+    # даты, а результат помечается как усечённый. -1 отключает подрезку.
+    TRAFFIC_DIMENSION_PANEL_HISTORY_TRUNCATE_WEEKDAY: int = 0
+
+    # Измерения трафика (WL — первое из них). Глобальные умолчания; каждое
+    # измерение может переопределить режим учёта своей строкой в БД.
+    # subquota — трафик измерения расходует и основную квоту (панель считает
+    #   все инбаунды в один usedTrafficBytes, так работает панель «как есть»);
+    # shielded — бот компенсирует: в панель уходит base_limit + израсходованное
+    #   измерением, и основная квота остаётся нетронутой.
+    TRAFFIC_DIMENSION_ACCOUNTING_MODE: str = 'subquota'
+    # observe — только считаем; notify — считаем и уведомляем; enforce — режем доступ.
+    # Измерение идёт всегда, режим гейтит только запись в панель.
+    TRAFFIC_DIMENSION_ENFORCEMENT_MODE: str = 'observe'
+    # Предохранитель: если за цикл заблокировать пришлось бы больше подписок,
+    # чем разрешает любой из порогов, не блокируем никого и шлём одно
+    # уведомление админам. Ноль отключает соответствующий порог.
+    TRAFFIC_DIMENSION_ENFORCEMENT_MAX_BLOCKS_PER_CYCLE: int = 50
+    TRAFFIC_DIMENSION_ENFORCEMENT_MAX_BLOCKS_PERCENT: int = 10
+
+    # Как часто снимать пер-инбаунд трафик в собственный журнал. Не «раз в
+    # сутки»: панель делает TRUNCATE в понедельник 00:30 UTC, а воскресные
+    # сутки закрываются в 00:00 — на снятие итога есть полчаса. Чем реже
+    # цикл, тем больше недосчитанный хвост последних часов воскресенья.
+    # Цена интервала — один запрос к панели на подписку, у которой есть
+    # доступ хотя бы к одному инбаунду измерения; без измерений — ноль.
+    TRAFFIC_DIMENSION_SAMPLE_INTERVAL_MINUTES: int = 180
+    # Хранение наблюдений. Расчётное окно не длиннее месяца, запас нужен
+    # только на разбор жалоб и объяснение «откуда столько».
+    TRAFFIC_DIMENSION_SAMPLE_RETENTION_DAYS: int = 120
 
     # RemnaWave incoming webhooks (real-time event delivery from backend)
     REMNAWAVE_WEBHOOK_ENABLED: bool = False
@@ -1921,16 +1946,6 @@ class Settings(BaseSettings):
             return []
         # Убираем комментарии (все после #)
         value = self.TRAFFIC_EXCLUDED_USER_UUIDS.split('#')[0].strip()
-        if not value:
-            return []
-        return [uuid.strip().lower() for uuid in value.split(',') if uuid.strip()]
-
-    def get_wl_inbound_uuids(self) -> list[str]:
-        """Возвращает список UUID инбаундов, засчитываемых как WL (БС) трафик."""
-        if not self.WL_INBOUND_UUIDS:
-            return []
-        # Убираем комментарии (все после #)
-        value = self.WL_INBOUND_UUIDS.split('#')[0].strip()
         if not value:
             return []
         return [uuid.strip().lower() for uuid in value.split(',') if uuid.strip()]

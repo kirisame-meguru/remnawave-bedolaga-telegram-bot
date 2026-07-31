@@ -35,6 +35,8 @@ from . import (
     support_settings,
     system_logs,
     tickets,
+    traffic_dimensions,
+    traffic_why,
     trials,
     updates,
     user_messages,

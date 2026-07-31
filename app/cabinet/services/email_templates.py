@@ -5,6 +5,7 @@ Supports multiple languages: ru, en, zh, ua, fa
 """
 
 import html
+import re
 from functools import partial
 from typing import Any
 
@@ -93,6 +94,17 @@ class EmailNotificationTemplates:
         }
         for webhook_type, webhook_kind in webhook_email_kinds.items():
             template_map[webhook_type] = partial(self._webhook_event_email, webhook_kind)
+
+        # Измерения трафика делят один билдер: копирайт берётся из тех же
+        # ключей локализации, что и телеграм-текст, — одна формулировка на оба
+        # канала, а не две расходящиеся копии.
+        for dimension_type in (
+            NotificationType.TRAFFIC_DIMENSION_WARNING,
+            NotificationType.TRAFFIC_DIMENSION_EXHAUSTED,
+            NotificationType.TRAFFIC_DIMENSION_BLOCKED,
+            NotificationType.TRAFFIC_DIMENSION_RESTORED,
+        ):
+            template_map[dimension_type] = partial(self._traffic_dimension_email, dimension_type)
 
         template_func = template_map.get(notification_type)
         if not template_func:
@@ -792,6 +804,53 @@ class EmailNotificationTemplates:
         body = body.replace('{device}', device_suffix)
 
         content = f'<h2>{subject}</h2><div class="highlight">{body}</div>{self._get_cabinet_button(language)}'
+        return {
+            'subject': subject,
+            'body_html': self._get_base_template(content, language),
+        }
+
+    _TRAFFIC_DIMENSION_EMAIL_TONE = {
+        'traffic_dimension_warning': 'warning',
+        'traffic_dimension_exhausted': 'danger',
+        'traffic_dimension_blocked': 'danger',
+        'traffic_dimension_restored': 'success',
+    }
+
+    def _traffic_dimension_email(
+        self,
+        notification_type: 'NotificationType',
+        language: str,
+        context: dict[str, Any],
+    ) -> dict[str, str]:
+        """Email для событий измерений трафика (пользователи без Telegram).
+
+        Текст берётся из локали — того же ключа, который уходит в Telegram.
+        Дублировать формулировки во второй раз значило бы гарантированно их
+        рассинхронизировать: правку внесут в одном месте, а увидят в другом.
+        """
+        from app.localization.texts import get_texts
+
+        key = notification_type.value.upper()
+        template = get_texts(language).t(key, '')
+        if not template:
+            return None
+
+        try:
+            rendered = template.format(**context)
+        except (KeyError, IndexError, ValueError):
+            return None
+
+        # Первая строка локали — заголовок вида "<b>...</b>", остальное — тело.
+        head, _, rest = rendered.partition('\n')
+        subject = re.sub(r'<[^>]+>', '', head).strip()
+        tone = self._TRAFFIC_DIMENSION_EMAIL_TONE.get(notification_type.value, 'highlight')
+        body = rest.strip().replace('\n', '<br>')
+
+        content = (
+            f'<h2>{html.escape(subject)}</h2>'
+            f'<div class="highlight {tone}"><p>{body}</p></div>'
+            f'{self._get_cabinet_button(language)}'
+        )
         return {
             'subject': subject,
             'body_html': self._get_base_template(content, language),

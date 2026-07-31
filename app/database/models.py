@@ -33,7 +33,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Mapped, backref, mapped_column, relationship
-from sqlalchemy.sql import func
+from sqlalchemy.sql import expression, func
 
 
 class AwareDateTime(TypeDecorator):
@@ -1920,6 +1920,18 @@ class Tariff(Base):
     # Подписки на этом тарифе
     subscriptions = relationship('Subscription', back_populates='tariff')
 
+    # Что тариф даёт и продаёт по каждому измерению трафика.
+    # Отсутствие строки = тариф это измерение не предлагает.
+    # noload: тариф читается на каждом шаге покупки, а измерения нужны редко —
+    # грузим их явно через load_tariff_dimension_config().
+    traffic_dimensions = relationship(
+        'TariffTrafficDimension',
+        back_populates='tariff',
+        passive_deletes=True,
+        cascade='all, delete-orphan',
+        lazy='noload',
+    )
+
     @property
     def is_unlimited_traffic(self) -> bool:
         """Проверяет, безлимитный ли трафик."""
@@ -2005,10 +2017,28 @@ class Tariff(Base):
             return True  # Если у пользователя нет группы - доступен
         return any(pg.id == promo_group_id for pg in self.allowed_promo_groups)
 
+    def get_traffic_packages(self):
+        """Пакеты докупки в развёрнутом виде — с начислениями по измерениям.
+
+        Читает и старый формат (`{"100": 9900}`), и новый список дескрипторов:
+        различие определяется по типу данных, поэтому тарифы, настроенные до
+        появления измерений, продолжают работать без миграции.
+        """
+        from app.services.traffic_packages import parse_packages
+
+        return parse_packages(self.traffic_topup_packages)
+
     def get_traffic_topup_packages(self) -> dict[int, int]:
-        """Возвращает пакеты трафика для докупки: {ГБ: цена в копейках}."""
-        packages = self.traffic_topup_packages or {}
-        return {int(gb): int(price) for gb, price in packages.items()}
+        """Пакеты обычного трафика в старом виде: {ГБ: цена в копейках}.
+
+        Проекция, а не хранилище: пакеты с начислениями по измерениям сюда не
+        попадают. Так полдюжины мест, ничего не знающих про измерения
+        (клавиатуры, кабинет, мини-апп, автопокупка), продолжают видеть ровно
+        то, что умеют показать, вместо цены смеси под видом цены трафика.
+        """
+        from app.services.traffic_packages import legacy_projection
+
+        return legacy_projection(self.get_traffic_packages())
 
     def get_traffic_topup_price(self, gb: int) -> int | None:
         """Возвращает цену в копейках для указанного пакета трафика."""
@@ -2023,6 +2053,23 @@ class Tariff(Base):
     def can_topup_traffic(self) -> bool:
         """Проверяет, можно ли докупить трафик на этом тарифе."""
         return self.traffic_topup_enabled and bool(self.traffic_topup_packages) and not self.is_unlimited_traffic
+
+    def get_purchasable_traffic_packages(self):
+        """Пакеты, которые на этом тарифе действительно можно купить.
+
+        Безлимитный обычный трафик отсекает пакеты, начисляющие обычный трафик,
+        — докупать нечего. Но измерения при этом остаются лимитированными, и
+        пакет, начисляющий только их, продавать по-прежнему нужно: иначе на
+        безлимитном тарифе исчерпанную квоту измерения было бы не пополнить.
+        """
+        if not self.traffic_topup_enabled:
+            return ()
+        unlimited_base = self.is_unlimited_traffic
+        return tuple(
+            package
+            for package in self.get_traffic_packages()
+            if package.enabled and not (unlimited_base and any(grant.is_base for grant in package.grants))
+        )
 
     def get_daily_price_rubles(self) -> float:
         """Возвращает суточную цену в рублях."""
@@ -2262,13 +2309,6 @@ class User(Base):
         return False
 
 
-def _default_wl_traffic_limit_gb() -> int:
-    """Значение по умолчанию для wl_traffic_limit_gb новых подписок."""
-    from app.config import settings
-
-    return int(getattr(settings, 'WL_TRAFFIC_DEFAULT_LIMIT_GB', 0) or 0)
-
-
 class Subscription(Base):
     __tablename__ = 'subscriptions'
     __table_args__ = (
@@ -2297,14 +2337,11 @@ class Subscription(Base):
     start_date = Column(AwareDateTime(), default=func.now())
     end_date = Column(AwareDateTime(), nullable=False)
 
+    # Обычный трафик — измерение 'base' реестра traffic_dimensions: его состояние
+    # живёт здесь, а не в subscription_traffic_dimensions. Остальные измерения
+    # (WL и заведённые администратором) хранятся строками того реестра.
     traffic_limit_gb = Column(Integer, default=0)
     traffic_used_gb = Column(Float, default=0.0)
-    wl_traffic_limit_gb = Column(
-        Integer, default=_default_wl_traffic_limit_gb, server_default='0', nullable=False
-    )  # WL (БС) лимит, 0 = безлимит (по умолчанию из WL_TRAFFIC_DEFAULT_LIMIT_GB)
-    wl_traffic_used_gb = Column(
-        Float, default=0.0, server_default='0', nullable=False
-    )  # Кэш WL (БС) использованного трафика
     purchased_traffic_gb = Column(Integer, default=0)  # Докупленный трафик
     traffic_reset_at = Column(
         AwareDateTime(), nullable=True
@@ -2364,6 +2401,13 @@ class Subscription(Base):
     )
     grace_access_sessions = relationship(
         'GraceAccessSessionModel', back_populates='subscription', passive_deletes=True, lazy='noload'
+    )
+    traffic_dimension_states = relationship(
+        'SubscriptionTrafficDimension',
+        back_populates='subscription',
+        passive_deletes=True,
+        cascade='all, delete-orphan',
+        lazy='noload',
     )
 
     @property
@@ -2495,13 +2539,6 @@ class Subscription(Base):
         used = self.traffic_used_gb or 0.0
         return min((used / self.traffic_limit_gb) * 100, 100.0)
 
-    @property
-    def wl_traffic_used_percent(self) -> float:
-        if not self.wl_traffic_limit_gb:
-            return 0.0
-        used = self.wl_traffic_used_gb or 0.0
-        return min((used / self.wl_traffic_limit_gb) * 100, 100.0)
-
     def extend_subscription(self, days: int):
         end = _aware(self.end_date)
         if end and end > datetime.now(UTC):
@@ -2627,6 +2664,192 @@ class GraceAccessSessionModel(Base):
     subscription = relationship('Subscription', back_populates='grace_access_sessions')
 
 
+BASE_TRAFFIC_DIMENSION_KEY = 'base'
+
+
+class TrafficDimensionEnforcement(str, Enum):
+    """Чем ограничивается измерение, когда квота исчерпана."""
+
+    # Обычный трафик: лимит уходит в панель (trafficLimitBytes), панель сама режет.
+    PANEL_LIMIT = 'panel_limit'
+    # Пер-инбаунд лимита в панели нет, поэтому доступ снимается сквадами,
+    # содержащими инбаунды измерения. Остальной трафик продолжает работать.
+    SQUAD_STRIP = 'squad_strip'
+    # Только считаем и уведомляем.
+    NOTIFY_ONLY = 'notify_only'
+
+
+class TrafficAccountingMode(str, Enum):
+    """Как измерение соотносится с общим счётчиком панели.
+
+    Панель считает `usedTrafficBytes` по всем инбаундам сразу, поэтому трафик
+    измерения по умолчанию расходует и основную квоту.
+    """
+
+    # Основная квота защищается: в панель уходит base_limit + израсходованное измерением.
+    SHIELDED = 'shielded'
+    # Трафик измерения расходует и основную квоту («из 20 ГБ не более 10 по этим маршрутам»).
+    SUBQUOTA = 'subquota'
+
+
+class TrafficDimension(Base):
+    """Измерение трафика — отдельный счётчик по своему набору инбаундов.
+
+    Строка `base` (`is_builtin`) описывает обычный трафик: её состояние живёт в
+    колонках `subscriptions.traffic_*`, а не в `subscription_traffic_dimensions`.
+    Остальные строки создаёт администратор.
+    """
+
+    __tablename__ = 'traffic_dimensions'
+    __table_args__ = (Index('ix_traffic_dimensions_enabled_position', 'is_enabled', 'position'),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(32), nullable=False, unique=True)  # стабильный идентификатор в JSON/коде
+    title = Column(JSON, default=dict)  # {'ru': '...', 'en': '...'} — заголовки от админа
+    fallback_title = Column(String(64), nullable=False, default='')
+    icon = Column(String(8), nullable=False, default='')
+
+    inbound_uuids = Column(JSON, default=list)  # UUID инбаундов, засчитываемых в это измерение
+    default_limit_gb = Column(Integer, nullable=False, server_default='0')  # 0 = безлимит
+
+    # NULL = взять глобальное значение из настроек
+    accounting_mode = Column(String(16), nullable=True)
+    enforcement = Column(String(16), nullable=False, server_default=TrafficDimensionEnforcement.SQUAD_STRIP.value)
+    # Категория скидки промогруппы; NULL = общая категория 'traffic'
+    discount_category = Column(String(32), nullable=True)
+
+    is_enabled = Column(Boolean, nullable=False, server_default=expression.true())
+    is_builtin = Column(Boolean, nullable=False, server_default=expression.false())
+    position = Column(Integer, nullable=False, server_default='0')
+
+    created_at = Column(AwareDateTime(), default=func.now())
+    updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now())
+
+    @property
+    def is_base(self) -> bool:
+        return self.key == BASE_TRAFFIC_DIMENSION_KEY
+
+
+class SubscriptionTrafficDimension(Base):
+    """Состояние одного измерения у одной подписки.
+
+    Инвариант повторяет обычный трафик: `limit_gb = base_limit_gb + purchased_gb`,
+    где `base_limit_gb == 0` означает безлимит и докупки не складываются.
+    """
+
+    __tablename__ = 'subscription_traffic_dimensions'
+    __table_args__ = (
+        UniqueConstraint('subscription_id', 'dimension_id', name='uq_subscription_traffic_dimension'),
+        Index('ix_subscription_traffic_dimensions_blocked', 'blocked_at'),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), nullable=False)
+    dimension_id = Column(Integer, ForeignKey('traffic_dimensions.id', ondelete='CASCADE'), nullable=False)
+
+    base_limit_gb = Column(Integer, nullable=False, server_default='0')  # 0 = безлимит
+    purchased_gb = Column(Integer, nullable=False, server_default='0')
+    used_gb = Column(Float, nullable=False, server_default='0')  # кэш для отрисовки
+
+    window_start = Column(Date, nullable=True)  # начало текущего расчётного окна (UTC-сутки)
+    # Самые ранние сутки окна, за которые у журнала реально есть наблюдения.
+    # coverage_from > window_start означает дыру в начале окна: панель хранит
+    # историю неделю, и всё, что бот не успел снять, потеряно навсегда. used_gb
+    # в этом случае занижен, и блокировать по нему нельзя.
+    coverage_from = Column(Date, nullable=True)
+    measured_at = Column(AwareDateTime(), nullable=True)
+    # False = последнее измерение не удалось; ноль в used_gb доверять нельзя
+    measured_known = Column(Boolean, nullable=False, server_default=expression.false())
+
+    blocked_at = Column(AwareDateTime(), nullable=True)
+    block_reason = Column(String(32), nullable=True)
+    # Сквады, снятые ради блокировки. connected_squads остаётся правом подписки
+    # и не меняется — восстановление это объединение множеств, а не догадка.
+    stripped_squads = Column(JSON, default=list)
+
+    created_at = Column(AwareDateTime(), default=func.now())
+    updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now())
+
+    subscription = relationship('Subscription', back_populates='traffic_dimension_states')
+    dimension = relationship('TrafficDimension', lazy='joined')
+
+    @property
+    def limit_gb(self) -> int:
+        base = self.base_limit_gb or 0
+        if base == 0:
+            return 0
+        return base + (self.purchased_gb or 0)
+
+    @property
+    def is_unlimited(self) -> bool:
+        return (self.base_limit_gb or 0) == 0
+
+    @property
+    def used_percent(self) -> float:
+        limit = self.limit_gb
+        if not limit:
+            return 0.0
+        return min(((self.used_gb or 0.0) / limit) * 100, 100.0)
+
+    @property
+    def is_blocked(self) -> bool:
+        return self.blocked_at is not None
+
+
+class TariffTrafficDimension(Base):
+    """Что тариф даёт и продаёт по конкретному измерению.
+
+    Отсутствие строки означает, что тариф это измерение не предлагает вовсе.
+    """
+
+    __tablename__ = 'tariff_traffic_dimensions'
+    __table_args__ = (UniqueConstraint('tariff_id', 'dimension_id', name='uq_tariff_traffic_dimension'),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    tariff_id = Column(Integer, ForeignKey('tariffs.id', ondelete='CASCADE'), nullable=False)
+    dimension_id = Column(Integer, ForeignKey('traffic_dimensions.id', ondelete='CASCADE'), nullable=False)
+
+    included_gb = Column(Integer, nullable=False, server_default='0')  # 0 = безлимит по этому измерению
+    topup_enabled = Column(Boolean, nullable=False, server_default=expression.false())
+    custom_enabled = Column(Boolean, nullable=False, server_default=expression.false())
+    price_per_gb_kopeks = Column(Integer, nullable=False, server_default='0')
+    min_gb = Column(Integer, nullable=False, server_default='0')
+    max_gb = Column(Integer, nullable=False, server_default='0')  # 0 = без верхней границы
+    max_topup_gb = Column(Integer, nullable=False, server_default='0')  # 0 = без ограничения
+
+    created_at = Column(AwareDateTime(), default=func.now())
+    updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now())
+
+    tariff = relationship('Tariff', back_populates='traffic_dimensions')
+    dimension = relationship('TrafficDimension', lazy='joined')
+
+
+class TrafficDimensionSample(Base):
+    """Сырое наблюдение: байты пользователя на одном инбаунде за одни UTC-сутки.
+
+    Панель раз в неделю делает TRUNCATE своей пер-инбаунд истории, поэтому
+    расчётное окно длиннее недели можно посчитать только по собственной копии.
+    Строки пишутся апсертом `bytes = GREATEST(existing, incoming)`: панельный
+    бакет дня только растёт, пока день открыт, и замерзает после закрытия, так
+    что повторное чтение идемпотентно, а очистка на стороне панели — no-op.
+    """
+
+    __tablename__ = 'traffic_dimension_samples'
+    __table_args__ = (
+        UniqueConstraint('remnawave_uuid', 'inbound_uuid', 'usage_date', name='uq_traffic_dimension_sample'),
+        Index('ix_traffic_dimension_samples_uuid_date', 'remnawave_uuid', 'usage_date'),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Ключ — панельный uuid, а не подписка: подписка может сменить remnawave_uuid,
+    # и старые наблюдения обязаны остаться валидной историей.
+    remnawave_uuid = Column(String(36), nullable=False)
+    inbound_uuid = Column(String(36), nullable=False)
+    usage_date = Column(Date, nullable=False)
+    bytes = Column(BigInteger, nullable=False, server_default='0')
+    fetched_at = Column(AwareDateTime(), default=func.now())
+
+
 class TrafficPurchase(Base):
     """Докупка трафика с индивидуальной датой истечения."""
 
@@ -2634,15 +2857,21 @@ class TrafficPurchase(Base):
     __table_args__ = (
         Index('ix_traffic_purchases_created_at', 'created_at'),
         # Composite index ускоряет housekeeping-запросы вида
-        # `WHERE subscription_id = :id AND expires_at <op> :now` (DELETE/SELECT
-        # в _housekeep_expired_purchases / _apply_base_limit_preserving_active_purchases).
-        Index('ix_traffic_purchases_sub_expires', 'subscription_id', 'expires_at'),
+        # `WHERE subscription_id = :id AND dimension = :dim AND expires_at <op> :now`
+        # (DELETE/SELECT в _housekeep_expired_purchases /
+        # _apply_base_limit_preserving_active_purchases).
+        Index('ix_traffic_purchases_sub_dim_expires', 'subscription_id', 'dimension', 'expires_at'),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     # subscription_id: индекс не нужен — leftmost prefix покрывается композитным
-    # ix_traffic_purchases_sub_expires(subscription_id, expires_at).
+    # ix_traffic_purchases_sub_dim_expires(subscription_id, dimension, expires_at).
     subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), nullable=False)
+
+    # Ключ измерения трафика ('base' — обычный трафик). Дискриминатор, а не FK:
+    # ledger переживает удаление измерения, и housekeeping обычного трафика
+    # обязан работать без обращения к таблице измерений.
+    dimension = Column(String(32), nullable=False, server_default=BASE_TRAFFIC_DIMENSION_KEY)
 
     traffic_gb = Column(Integer, nullable=False)  # Количество ГБ в покупке
     expires_at = Column(AwareDateTime(), nullable=False, index=True)  # Дата истечения (покупка + 30 дней)

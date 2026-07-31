@@ -31,6 +31,7 @@ from app.utils.cache import RateLimitCache, cache, cache_key
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from ...schemas.subscription import (
+    TrafficGrantResponse,
     TrafficPackageResponse,
     TrafficPurchaseRequest,
 )
@@ -46,6 +47,13 @@ logger = structlog.get_logger(__name__)
 REMNAWAVE_SYNC_TIMEOUT = 10.0
 
 router = APIRouter()
+
+
+async def _dimension_labels(db: AsyncSession, language: str | None) -> dict[str, str]:
+    """Заголовки измерений задаёт администратор — читаем их из реестра."""
+    from app.services.traffic_dimensions import traffic_dimensions
+
+    return {spec.key: spec.label(language) for spec in await traffic_dimensions.enabled(db)}
 
 
 @router.get('/traffic-packages', response_model=list[TrafficPackageResponse])
@@ -107,19 +115,36 @@ async def get_traffic_packages(
         if not getattr(tariff, 'traffic_topup_enabled', False):
             return []
 
-        # Проверяем безлимит
-        if tariff.traffic_limit_gb == 0:
+        # Безлимитный обычный трафик не мешает продавать пакеты измерений:
+        # их квоты остаются лимитированными и своими пакетами и пополняются.
+        purchasable = tariff.get_purchasable_traffic_packages()
+        if not purchasable:
             return []
 
-        packages = tariff.get_traffic_topup_packages() if hasattr(tariff, 'get_traffic_topup_packages') else {}
+        labels = await _dimension_labels(db, getattr(user, 'language', None))
         result = []
-
-        for gb, price in packages.items():
-            if price <= 0:
+        for package in purchasable:
+            if package.price_kopeks <= 0:
                 continue
-            result.append(_package_response(gb, price, is_unlimited=False))
+            response = _package_response(
+                package.total_gb,
+                package.price_kopeks,
+                is_unlimited=package.is_legacy_base and package.grants[0].is_unlimited,
+            )
+            response.id = package.id
+            response.title = package.title or None
+            response.grants = [
+                TrafficGrantResponse(
+                    dimension=grant.dimension,
+                    label=labels.get(grant.dimension, grant.dimension),
+                    gb=grant.gb,
+                    is_base=grant.is_base,
+                )
+                for grant in package.grants
+            ]
+            result.append(response)
 
-        return sorted(result, key=lambda x: x.gb)
+        return sorted(result, key=lambda x: (x.price_kopeks, x.gb))
 
     # Classic режим - глобальные настройки
     if not settings.is_traffic_topup_enabled():
@@ -170,6 +195,12 @@ async def purchase_traffic(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='No subscription found',
         )
+
+    if request.package_id:
+        # Пакет с начислениями по измерениям идёт своим путём: старая ветка
+        # оперирует одним числом ГБ и такой пакет описать не может.
+        return await _purchase_traffic_package(db, user, subscription, request.package_id)
+
     tariff = None
     base_price_kopeks = 0
     is_tariff_mode = settings.is_tariffs_mode() and subscription.tariff_id
@@ -442,6 +473,83 @@ async def purchase_traffic(
         response['base_price_kopeks'] = prorated_price
 
     return response
+
+
+async def _purchase_traffic_package(db: AsyncSession, user: User, subscription, package_id: str):
+    """Покупка пакета трафика по идентификатору.
+
+    Повторяет ту же последовательность, что и телеграм-бот: цена считается
+    заново из тарифа, списание идёт до начисления, а панель синхронизируется
+    после коммита — оплаченное не должно потеряться из-за недоступной панели.
+    """
+    from app.database.crud.tariff import get_tariff_by_id
+    from app.database.crud.transaction import create_transaction
+    from app.database.crud.user import subtract_user_balance
+    from app.database.models import TransactionType
+    from app.services.traffic_package_service import apply_traffic_package
+    from app.services.traffic_packages import package_by_id
+
+    if not subscription.tariff_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Traffic packages require a tariff')
+
+    tariff = await get_tariff_by_id(db, subscription.tariff_id)
+    package = package_by_id(tariff.get_purchasable_traffic_packages(), package_id) if tariff else None
+    if package is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Traffic package not found')
+
+    discount = _apply_addon_discount(user, 'traffic', package.price_kopeks, 30)
+    price_kopeks = discount['discounted']
+    if 0 < discount['percent'] < 100 and price_kopeks > 0:
+        price_kopeks = max(100, price_kopeks)
+
+    if price_kopeks > 0 and user.balance_kopeks < price_kopeks:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Insufficient balance')
+
+    if price_kopeks > 0:
+        charged = await subtract_user_balance(db, user, price_kopeks, f'Пакет трафика {package.id}')
+        if not charged:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Failed to charge balance')
+
+    application = await apply_traffic_package(db, subscription, package, price_kopeks=price_kopeks)
+    await create_transaction(
+        db=db,
+        user_id=user.id,
+        type=TransactionType.SUBSCRIPTION_PAYMENT,
+        amount_kopeks=price_kopeks,
+        description=f'Пакет трафика ({application.describe()})',
+    )
+    await db.commit()
+    await db.refresh(subscription)
+
+    try:
+        from app.services.subscription_service import SubscriptionService
+
+        await asyncio.wait_for(
+            SubscriptionService().update_remnawave_user(db, subscription),
+            timeout=REMNAWAVE_SYNC_TIMEOUT,
+        )
+    except Exception as error:
+        # Товар уже оплачен и начислен: недоступная панель не повод отдать
+        # пользователю ошибку — синхронизация догонит отдельным циклом.
+        logger.warning('Panel sync after traffic package purchase failed', error=error)
+
+    labels = await _dimension_labels(db, getattr(user, 'language', None))
+    return {
+        'success': True,
+        'package_id': package.id,
+        'price_kopeks': price_kopeks,
+        'granted': [
+            {
+                'dimension': item.grant.dimension,
+                'label': labels.get(item.grant.dimension, item.grant.dimension),
+                'gb': item.grant.gb,
+                'applied': item.applied,
+            }
+            for item in application.grants
+        ],
+        'traffic_limit_gb': subscription.traffic_limit_gb,
+        'balance_kopeks': user.balance_kopeks,
+    }
 
 
 @router.post('/traffic/save-cart')

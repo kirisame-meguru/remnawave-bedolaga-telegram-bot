@@ -2139,5 +2139,10 @@
   "LAVA_RECURRING_NOTIFY_CANCELLED": "ℹ️ Lava auto-renewal has been cancelled.",
   "LAVA_RECURRING_NOTIFY_CONFIRMED": "✅ Subscription renewed by Lava auto-payment.",
   "LAVA_RECURRING_NOTIFY_FAILED": "⚠️ Lava auto-renewal payment failed.",
-  "LAVA_RECURRING_PAY_BUTTON": "💳 Pay"
+  "LAVA_RECURRING_PAY_BUTTON": "💳 Pay",
+  "TRAFFIC_DIMENSION_WARNING": "⚠️ <b>{dimension}: running low</b>\n\nUsed: {used:.1f} / {limit} GB ({percent:.0f}%)\n\nOnce the limit is reached, access on this route will be closed until the end of the billing period. You can buy more traffic in the subscription section.",
+  "TRAFFIC_DIMENSION_EXHAUSTED": "🚫 <b>{dimension}: limit reached</b>\n\nUsed {used:.1f} GB out of {limit} GB.\n\nBuy more traffic in the subscription section to keep using this route.",
+  "TRAFFIC_DIMENSION_BLOCKED": "🚫 <b>{dimension}: access suspended</b>\n\nUsed {used:.1f} GB out of {limit} GB.\n\nAccess on this route is closed. Your other routes keep working as usual. To restore access, buy more traffic in the subscription section — or wait for the next billing period to start.",
+  "TRAFFIC_DIMENSION_RESTORED": "✅ <b>{dimension}: access restored</b>\n\nThe limit is available again: {limit} GB.",
+  "TRAFFIC_PACKAGE_UNAVAILABLE": "⚠️ This package is no longer available"
 }

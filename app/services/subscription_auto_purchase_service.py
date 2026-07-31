@@ -1868,6 +1868,116 @@ async def _auto_add_devices(
     return True
 
 
+async def _auto_add_traffic_package(
+    db: AsyncSession,
+    user: User,
+    cart_data: dict,
+    *,
+    bot: Bot | None = None,
+) -> bool:
+    """Автопокупка пакета трафика после пополнения баланса.
+
+    Цена пересчитывается из тарифа заново, а не берётся из корзины: между
+    сохранением корзины и пополнением администратор мог изменить пакет, и
+    списывать старую цену за новый набор начислений нельзя.
+    """
+    from app.database.crud.subscription import get_subscription_by_id_for_user
+    from app.database.crud.tariff import get_tariff_by_id
+    from app.database.crud.user import lock_user_for_pricing, subtract_user_balance
+    from app.database.models import PaymentMethod
+    from app.services.traffic_package_service import apply_traffic_package
+    from app.services.traffic_packages import package_by_id
+
+    package_id = str(cart_data.get('package_id') or '')
+    subscription_id = _safe_int(cart_data.get('subscription_id'))
+    if not package_id or subscription_id <= 0:
+        logger.warning(
+            '🔁 Автопокупка пакета трафика: некорректные данные корзины',
+            format_user_id=_format_user_id(user),
+            package_id=package_id,
+        )
+        return False
+
+    subscription = await get_subscription_by_id_for_user(db, subscription_id, user.id)
+    if subscription is None or subscription.is_trial or not subscription.tariff_id:
+        await _delete_cart_for_subscription(user.id, cart_data)
+        return False
+
+    user = await lock_user_for_pricing(db, user.id)
+
+    tariff = await get_tariff_by_id(db, subscription.tariff_id)
+    package = package_by_id(tariff.get_purchasable_traffic_packages(), package_id) if tariff else None
+    if package is None:
+        logger.warning(
+            '🔁 Автопокупка пакета трафика: пакет больше не доступен, корзина удалена',
+            format_user_id=_format_user_id(user),
+            package_id=package_id,
+        )
+        await _delete_cart_for_subscription(user.id, cart_data)
+        return False
+
+    period_hint_days: int | None = None
+    if subscription.end_date:
+        days_remaining = (subscription.end_date - datetime.now(UTC)).days
+        period_hint_days = days_remaining if days_remaining > 0 else None
+
+    price_kopeks, _, _ = PricingEngine.calculate_traffic_discount(package.price_kopeks, user, period_hint_days)
+
+    if price_kopeks > 0 and user.balance_kopeks < price_kopeks:
+        logger.info(
+            '🔁 Автопокупка пакета трафика: недостаточно средств',
+            format_user_id=_format_user_id(user),
+            balance_kopeks=user.balance_kopeks,
+            price_kopeks=price_kopeks,
+        )
+        return False
+
+    try:
+        if price_kopeks > 0:
+            success = await subtract_user_balance(
+                db,
+                user,
+                price_kopeks,
+                f'Пакет трафика {package.id}',
+                create_transaction=True,
+                payment_method=PaymentMethod.BALANCE,
+                transaction_type=TransactionType.SUBSCRIPTION_PAYMENT,
+            )
+            if not success:
+                logger.warning(
+                    '❌ Автопокупка пакета трафика: не удалось списать баланс',
+                    format_user_id=_format_user_id(user),
+                )
+                return False
+
+        application = await apply_traffic_package(db, subscription, package, price_kopeks=price_kopeks)
+        await db.commit()
+    except Exception as error:
+        await db.rollback()
+        logger.error(
+            '❌ Автопокупка пакета трафика: ошибка начисления',
+            format_user_id=_format_user_id(user),
+            error=error,
+        )
+        return False
+
+    try:
+        from app.services.subscription_service import SubscriptionService
+
+        await SubscriptionService().update_remnawave_user(db, subscription)
+    except Exception as error:
+        logger.error('❌ Автопокупка пакета трафика: ошибка синхронизации с панелью', error=error)
+
+    await _delete_cart_for_subscription(user.id, cart_data)
+    logger.info(
+        '✅ Автопокупка пакета трафика выполнена',
+        format_user_id=_format_user_id(user),
+        package_id=package.id,
+        granted=application.describe(),
+    )
+    return True
+
+
 async def _auto_add_traffic(
     db: AsyncSession,
     user: User,
@@ -3139,6 +3249,8 @@ async def _process_single_cart(
         return await _auto_add_devices(db, user, cart_data, bot=bot)
     if cart_mode == 'add_traffic':
         return await _auto_add_traffic(db, user, cart_data, bot=bot)
+    if cart_mode == 'add_traffic_package':
+        return await _auto_add_traffic_package(db, user, cart_data, bot=bot)
 
     logger.warning(
         'Автопокупка: неизвестный cart_mode, пропускаем',

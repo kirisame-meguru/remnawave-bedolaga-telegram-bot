@@ -21,6 +21,7 @@ from app.keyboards.inline import (
     get_devices_keyboard,
     get_insufficient_balance_keyboard,
     get_reset_traffic_confirm_keyboard,
+    get_traffic_packages_keyboard_from_tariff,
 )
 from app.localization.texts import get_texts
 from app.services.pricing_engine import PricingEngine
@@ -136,6 +137,25 @@ async def handle_add_traffic(callback: types.CallbackQuery, db_user: User, db: A
             period_hint_days,
         )
 
+        # Если тариф продаёт пакеты с начислениями по измерениям, показываем их:
+        # плоский список «ГБ → цена» такой пакет описать не может.
+        dimension_packages = await _dimension_packages_for(db, tariff)
+        if dimension_packages:
+            await callback.message.edit_text(
+                _add_traffic_prompt(texts, subscription),
+                reply_markup=get_traffic_packages_keyboard_from_tariff(
+                    db_user.language,
+                    dimension_packages,
+                    await _dimension_labels(db, db_user.language),
+                    subscription.end_date,
+                    traffic_discount_percent,
+                    sub_id=sub_id,
+                ),
+                parse_mode='HTML',
+            )
+            await callback.answer()
+            return
+
         prompt_text = texts.t(
             'ADD_TRAFFIC_PROMPT',
             (
@@ -206,6 +226,38 @@ async def handle_add_traffic(callback: types.CallbackQuery, db_user: User, db: A
     )
 
     await callback.answer()
+
+
+def _add_traffic_prompt(texts, subscription) -> str:
+    return texts.t(
+        'ADD_TRAFFIC_PROMPT',
+        ('📈 <b>Добавить трафик к подписке</b>\n\nТекущий лимит: {current_traffic}\nВыберите дополнительный трафик:'),
+    ).format(current_traffic=texts.format_traffic(subscription.traffic_limit_gb))
+
+
+async def _dimension_packages_for(db: AsyncSession, tariff):
+    """Пакеты тарифа, если хотя бы один из них начисляет неосновное измерение.
+
+    Пока тариф продаёт только обычный трафик, работает прежняя клавиатура —
+    интерфейс не должен меняться там, где измерений нет.
+    """
+    from app.services.traffic_dimensions import traffic_dimensions
+
+    packages = tariff.get_purchasable_traffic_packages()
+    if not packages:
+        return ()
+    if not any(not grant.is_base for package in packages for grant in package.grants):
+        return ()
+    if not await traffic_dimensions.non_base(db):
+        # Измерения выключены — начисления по ним всё равно не применятся.
+        return ()
+    return packages
+
+
+async def _dimension_labels(db: AsyncSession, language: str) -> dict[str, str]:
+    from app.services.traffic_dimensions import traffic_dimensions
+
+    return {spec.key: spec.label(language) for spec in await traffic_dimensions.enabled(db)}
 
 
 def _calculate_traffic_reset_price(subscription) -> int:
@@ -710,6 +762,169 @@ async def add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSes
         await callback.message.edit_text(texts.ERROR, reply_markup=get_back_keyboard(db_user.language))
 
     await callback.answer()
+
+
+async def add_traffic_package(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext = None):
+    """Покупка пакета трафика по идентификатору (`atp:{id}`).
+
+    Отдельный обработчик от `add_traffic`: тот адресует пакет числом гигабайт,
+    а пакет с несколькими начислениями числом не адресуется. Старый callback
+    остаётся рабочим — тарифы без измерений ходят прежним путём.
+    """
+    from app.database.crud.tariff import get_tariff_by_id
+    from app.database.crud.user import lock_user_for_pricing
+    from app.services.traffic_package_service import apply_traffic_package
+    from app.services.traffic_packages import package_by_id
+
+    texts = get_texts(db_user.language)
+    package_id = callback.data.split(':', 1)[1]
+
+    subscription, _ = await _resolve_subscription(callback, db_user, db, state)
+    if subscription is None:
+        return
+    if subscription.is_trial:
+        await callback.answer(
+            texts.t('PAID_FEATURE_ONLY', '⚠ Эта функция доступна только для платных подписок'),
+            show_alert=True,
+        )
+        return
+    if not subscription.tariff_id:
+        await callback.answer(texts.ERROR, show_alert=True)
+        return
+
+    tariff = await get_tariff_by_id(db, subscription.tariff_id)
+    package = package_by_id(tariff.get_purchasable_traffic_packages(), package_id) if tariff else None
+    if package is None:
+        # Пакет мог быть удалён администратором, пока пользователь смотрел меню.
+        await callback.answer(
+            texts.t('TRAFFIC_PACKAGE_UNAVAILABLE', '⚠️ Этот пакет больше недоступен'),
+            show_alert=True,
+        )
+        return
+
+    # Лочим пользователя ДО расчёта цены: скидка промогруппы может измениться
+    # между чтением и списанием.
+    db_user = await lock_user_for_pricing(db, db_user.id)
+    subscription, _ = await _resolve_subscription(callback, db_user, db, state)
+    if subscription is None:
+        return
+
+    period_hint_days = _get_period_hint_from_subscription(subscription)
+    price, discount_value, discount_pct = PricingEngine.calculate_traffic_discount(
+        package.price_kopeks,
+        db_user,
+        period_hint_days,
+    )
+
+    if price > 0 and db_user.balance_kopeks < price:
+        await _offer_topup_for_package(callback, db_user, subscription, package, price, discount_pct, texts)
+        return
+
+    try:
+        if price > 0:
+            success = await subtract_user_balance(db, db_user, price, f'Пакет трафика: {package.id}')
+            if not success:
+                await callback.answer('⚠️ Ошибка списания средств', show_alert=True)
+                return
+
+        application = await apply_traffic_package(db, subscription, package, price_kopeks=price)
+        await reactivate_subscription(db, subscription)
+        await db.commit()
+
+        subscription_service = SubscriptionService()
+        await subscription_service.update_remnawave_user(db, subscription)
+
+        await create_transaction(
+            db=db,
+            user_id=db_user.id,
+            type=TransactionType.SUBSCRIPTION_PAYMENT,
+            amount_kopeks=price,
+            description=f'Пакет трафика ({application.describe()})',
+        )
+        await db.refresh(db_user)
+        await db.refresh(subscription)
+
+        await callback.message.edit_text(
+            await _package_success_text(
+                db, texts, db_user, subscription, application, price, discount_value, discount_pct
+            ),
+            reply_markup=get_back_keyboard(db_user.language),
+        )
+        logger.info(
+            '✅ Пользователь купил пакет трафика',
+            telegram_id=db_user.telegram_id,
+            package_id=package.id,
+            granted=application.describe(),
+        )
+    except Exception as e:
+        logger.error('Ошибка покупки пакета трафика', package_id=package_id, error=e)
+        await callback.message.edit_text(texts.ERROR, reply_markup=get_back_keyboard(db_user.language))
+
+    await callback.answer()
+
+
+async def _offer_topup_for_package(callback, db_user, subscription, package, price, discount_pct, texts):
+    """Сохраняет корзину и предлагает пополнение — как и для обычной докупки."""
+    missing_kopeks = price - db_user.balance_kopeks
+    cart_data = {
+        'cart_mode': 'add_traffic_package',
+        'subscription_id': subscription.id,
+        'package_id': package.id,
+        'price_kopeks': price,
+        'base_price_kopeks': package.price_kopeks,
+        'discount_percent': discount_pct,
+        'source': 'bot',
+        'description': f'Пакет трафика {package.id}',
+    }
+    try:
+        await user_cart_service.save_user_cart(db_user.id, cart_data)
+    except Exception as e:
+        logger.error('Error saving cart for traffic package', error=e)
+
+    message_text = texts.t(
+        'ADDON_INSUFFICIENT_FUNDS_MESSAGE',
+        (
+            '⚠️ <b>Недостаточно средств</b>\n\n'
+            'Стоимость услуги: {required}\n'
+            'На балансе: {balance}\n'
+            'Не хватает: {missing}\n\n'
+            'Выберите способ пополнения. Сумма подставится автоматически.'
+        ),
+    ).format(
+        required=texts.format_price(price, round_kopeks=False),
+        balance=texts.format_price(db_user.balance_kopeks, round_kopeks=False),
+        missing=texts.format_price(missing_kopeks, round_kopeks=False),
+    )
+    await callback.message.edit_text(
+        message_text,
+        reply_markup=get_insufficient_balance_keyboard(db_user.language, amount_kopeks=missing_kopeks),
+        parse_mode='HTML',
+    )
+    await callback.answer()
+
+
+async def _package_success_text(db, texts, db_user, subscription, application, price, discount_value, discount_pct):
+    """Что именно начислено — по строке на измерение, включая обычный трафик."""
+    from app.services.traffic_dimensions import format_extra_dimension_lines
+
+    lines = ['✅ Пакет успешно активирован!', '']
+    if application.base_gb:
+        lines.append(f'📊 Обычный трафик: +{application.base_gb} ГБ')
+        lines.append(f'Новый лимит: {texts.format_traffic(subscription.traffic_limit_gb)}')
+    for line in await format_extra_dimension_lines(db, subscription, db_user.language):
+        lines.append(f'• {line}')
+
+    skipped = [item for item in application.grants if not item.applied]
+    if skipped:
+        lines.append('')
+        lines.append('⚠️ Часть пакета не начислена — обратитесь в поддержку.')
+
+    if price > 0:
+        lines.append('')
+        lines.append(f'💰 Списано: {texts.format_price(price)}')
+        if discount_value > 0:
+            lines.append(f'(скидка {discount_pct}%: -{texts.format_price(discount_value)})')
+    return '\n'.join(lines)
 
 
 async def handle_no_traffic_packages(callback: types.CallbackQuery, db_user: User):

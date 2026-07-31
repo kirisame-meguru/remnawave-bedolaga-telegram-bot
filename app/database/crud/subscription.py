@@ -14,6 +14,7 @@ from sqlalchemy.orm.exc import StaleDataError
 from app.config import settings
 from app.database.crud.notification import clear_notifications
 from app.database.models import (
+    BASE_TRAFFIC_DIMENSION_KEY,
     Subscription,
     SubscriptionServer,
     SubscriptionStatus,
@@ -875,6 +876,7 @@ async def _housekeep_expired_purchases(
             delete(TrafficPurchase)
             .where(
                 TrafficPurchase.subscription_id == subscription.id,
+                TrafficPurchase.dimension == BASE_TRAFFIC_DIMENSION_KEY,
                 TrafficPurchase.expires_at <= now,
             )
             .execution_options(synchronize_session='fetch')
@@ -892,6 +894,7 @@ async def _housekeep_expired_purchases(
         delete(TrafficPurchase)
         .where(
             TrafficPurchase.subscription_id == subscription.id,
+            TrafficPurchase.dimension == BASE_TRAFFIC_DIMENSION_KEY,
             TrafficPurchase.expires_at <= now,
         )
         .execution_options(synchronize_session='fetch')
@@ -899,6 +902,7 @@ async def _housekeep_expired_purchases(
     active_result = await db.execute(
         select(TrafficPurchase).where(
             TrafficPurchase.subscription_id == subscription.id,
+            TrafficPurchase.dimension == BASE_TRAFFIC_DIMENSION_KEY,
             TrafficPurchase.expires_at > now,
         )
     )
@@ -946,6 +950,7 @@ async def _apply_base_limit_preserving_active_purchases(
         active_check = await db.execute(
             select(TrafficPurchase).where(
                 TrafficPurchase.subscription_id == subscription.id,
+                TrafficPurchase.dimension == BASE_TRAFFIC_DIMENSION_KEY,
                 TrafficPurchase.expires_at > now,
             )
         )
@@ -973,6 +978,7 @@ async def _apply_base_limit_preserving_active_purchases(
         delete(TrafficPurchase)
         .where(
             TrafficPurchase.subscription_id == subscription.id,
+            TrafficPurchase.dimension == BASE_TRAFFIC_DIMENSION_KEY,
             TrafficPurchase.expires_at <= now,
         )
         .execution_options(synchronize_session='fetch')
@@ -980,6 +986,7 @@ async def _apply_base_limit_preserving_active_purchases(
     active_result = await db.execute(
         select(TrafficPurchase).where(
             TrafficPurchase.subscription_id == subscription.id,
+            TrafficPurchase.dimension == BASE_TRAFFIC_DIMENSION_KEY,
             TrafficPurchase.expires_at > now,
         )
     )
@@ -1417,7 +1424,12 @@ async def add_subscription_traffic(db: AsyncSession, subscription: Subscription,
     from app.database.models import TrafficPurchase
 
     new_expires_at = datetime.now(UTC) + timedelta(days=30)
-    new_purchase = TrafficPurchase(subscription_id=subscription.id, traffic_gb=gb, expires_at=new_expires_at)
+    new_purchase = TrafficPurchase(
+        subscription_id=subscription.id,
+        dimension=BASE_TRAFFIC_DIMENSION_KEY,
+        traffic_gb=gb,
+        expires_at=new_expires_at,
+    )
     db.add(new_purchase)
 
     # Обновляем общий счетчик докупленного трафика
@@ -1429,6 +1441,7 @@ async def add_subscription_traffic(db: AsyncSession, subscription: Subscription,
     active_purchases_query = (
         select(TrafficPurchase)
         .where(TrafficPurchase.subscription_id == subscription.id)
+        .where(TrafficPurchase.dimension == BASE_TRAFFIC_DIMENSION_KEY)
         .where(TrafficPurchase.expires_at > now)
     )
     active_purchases_result = await db.execute(active_purchases_query)

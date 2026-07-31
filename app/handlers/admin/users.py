@@ -48,6 +48,13 @@ from app.services.grace_access_runtime import (
 )
 from app.services.remnawave_service import RemnaWaveService
 from app.services.subscription_service import SubscriptionService
+from app.services.traffic_dimensions import (
+    ensure_dimension_row,
+    format_dimension_value,
+    format_extra_dimension_lines,
+    get_dimension_states,
+    traffic_dimensions,
+)
 from app.services.user_service import UserService
 from app.states import AdminStates
 from app.utils.decorators import admin_required, error_handler
@@ -61,6 +68,9 @@ from app.utils.user_utils import get_effective_referral_commission_percent
 
 
 logger = structlog.get_logger(__name__)
+
+# Потолок ручного лимита измерения трафика: защита от опечатки в поле ввода.
+MAX_DIMENSION_LIMIT_GB = 10000
 
 
 # =============================================================================
@@ -925,13 +935,10 @@ async def _render_user_subscription_overview(
         text += f'<b>Окончание:</b> {format_datetime(subscription.end_date)}\n'
         text += f'<b>Трафик:</b> {traffic_display}\n'
         text += f'<b>Устройства:</b> {Texts.format_device_limit(subscription.device_limit)}\n'
-        if settings.WL_TRAFFIC_ENABLED:
-            wl_used = subscription.wl_traffic_used_gb or 0.0
-            if (subscription.wl_traffic_limit_gb or 0) == 0:
-                wl_display = f'{wl_used:.1f}/♾️ ГБ'
-            else:
-                wl_display = f'{wl_used:.1f}/{subscription.wl_traffic_limit_gb} ГБ'
-            text += f'<b>WL Трафик (БС):</b> {wl_display}\n'
+        dimension_states = await get_dimension_states(db, subscription, specs=await traffic_dimensions.non_base(db))
+        for dimension_state in dimension_states:
+            value = format_dimension_value(dimension_state, unlimited_mark='♾️')
+            text += f'<b>{dimension_state.spec.label()}:</b> {value}\n'
         text += f'<b>Устройства:</b> {subscription.device_limit}\n'
 
         if subscription.is_active:
@@ -984,11 +991,13 @@ async def _render_user_subscription_overview(
             ],
         ]
 
-        if settings.WL_TRAFFIC_ENABLED:
+        # По кнопке на каждое измерение сверх обычного трафика.
+        for dimension_state in dimension_states:
             keyboard.append(
                 [
                     types.InlineKeyboardButton(
-                        text='⚪ WL лимит (БС)', callback_data=f'admin_user_wl_traffic_{user_id}{_sid}'
+                        text=f'🛠️ Лимит: {dimension_state.spec.label()}',
+                        callback_data=f'admin_user_dim_traffic_{dimension_state.spec.id}_{user_id}{_sid}',
                     ),
                 ]
             )
@@ -2857,11 +2866,8 @@ async def show_user_statistics(callback: types.CallbackQuery, db_user: User, db:
         text += f'• Статус: {sub_status}{sub_type}\n'
         text += f'• Трафик: {subscription.traffic_used_gb:.1f}/{subscription.traffic_limit_gb} ГБ\n'
         text += f'• Устройства: {Texts.format_device_limit(subscription.device_limit)}\n'
-        if settings.WL_TRAFFIC_ENABLED:
-            wl_stats = await RemnaWaveService().get_user_wl_traffic_stats(subscription)
-            wl_limit = wl_stats['wl_limit_gb']
-            wl_limit_display = '∞' if wl_limit <= 0 else f'{wl_limit}'
-            text += f'• WL Трафик (БС): {wl_stats["wl_used_gb"]:.1f}/{wl_limit_display} ГБ\n'
+        for line in await format_extra_dimension_lines(db, subscription):
+            text += f'• {line}\n'
         text += f'• Устройства: {subscription.device_limit}\n'
         text += f'• Стран: {len(subscription.connected_squads or [])}\n'
     else:
@@ -4455,10 +4461,21 @@ async def _update_user_traffic(
 
 @admin_required
 @error_handler
-async def start_wl_traffic_edit(callback: types.CallbackQuery, db_user: User, state: FSMContext):
-    user_id, subscription_id = _extract_admin_sub_context(callback.data)
+async def start_dimension_traffic_edit(
+    callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext
+):
+    """Правка лимита одного измерения трафика у подписки."""
+    dimension_id, user_id, subscription_id = _extract_admin_dimension_context(callback.data)
+    spec = await _find_dimension_spec(db, dimension_id)
+    if spec is None:
+        await callback.answer('Измерение трафика не найдено', show_alert=True)
+        return
 
-    await state.update_data(editing_wl_traffic_user_id=user_id, admin_subscription_id=subscription_id)
+    await state.update_data(
+        editing_dimension_id=dimension_id,
+        editing_dimension_user_id=user_id,
+        admin_subscription_id=subscription_id,
+    )
 
     _sid = f'_s{subscription_id}' if subscription_id else ''
     back_cb = (
@@ -4467,56 +4484,46 @@ async def start_wl_traffic_edit(callback: types.CallbackQuery, db_user: User, st
         else f'admin_user_subscription_{user_id}'
     )
 
+    def _preset(gb: int, label: str) -> types.InlineKeyboardButton:
+        return types.InlineKeyboardButton(
+            text=label,
+            callback_data=f'admin_user_dim_traffic_set_{dimension_id}_{user_id}{_sid}_{gb}',
+        )
+
     await callback.message.edit_text(
-        '⚪ <b>Изменение WL (БС) лимита трафика</b>\n\n'
-        'Введите новый WL-лимит в ГБ:\n'
-        '• 0 - безлимитный WL-трафик\n'
+        f'{spec.label()} <b>— изменение лимита трафика</b>\n\n'
+        'Введите новый лимит в ГБ:\n'
+        '• 0 - безлимит\n'
         '• Примеры: 50, 100, 500, 1000\n'
-        '• Максимум: 10000 ГБ\n\n'
+        f'• Максимум: {MAX_DIMENSION_LIMIT_GB} ГБ\n\n'
         'Или нажмите /cancel для отмены',
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[
-                [
-                    types.InlineKeyboardButton(
-                        text='50 ГБ', callback_data=f'admin_user_wl_traffic_set_{user_id}{_sid}_50'
-                    ),
-                    types.InlineKeyboardButton(
-                        text='100 ГБ', callback_data=f'admin_user_wl_traffic_set_{user_id}{_sid}_100'
-                    ),
-                ],
-                [
-                    types.InlineKeyboardButton(
-                        text='500 ГБ', callback_data=f'admin_user_wl_traffic_set_{user_id}{_sid}_500'
-                    ),
-                    types.InlineKeyboardButton(
-                        text='1000 ГБ', callback_data=f'admin_user_wl_traffic_set_{user_id}{_sid}_1000'
-                    ),
-                ],
-                [
-                    types.InlineKeyboardButton(
-                        text='♾️ Безлимит', callback_data=f'admin_user_wl_traffic_set_{user_id}{_sid}_0'
-                    )
-                ],
+                [_preset(50, '50 ГБ'), _preset(100, '100 ГБ')],
+                [_preset(500, '500 ГБ'), _preset(1000, '1000 ГБ')],
+                [_preset(0, '♾️ Безлимит')],
                 [types.InlineKeyboardButton(text='❌ Отмена', callback_data=back_cb)],
             ]
         ),
     )
 
-    await state.set_state(AdminStates.editing_user_wl_traffic)
+    await state.set_state(AdminStates.editing_user_dimension_traffic)
     await callback.answer()
 
 
 @admin_required
 @error_handler
-async def set_user_wl_traffic_button(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def set_user_dimension_traffic_button(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     parts = callback.data.split('_')
     traffic_gb = int(parts[-1])
     if parts[-2].startswith('s') and parts[-2][1:].isdigit():
         subscription_id = int(parts[-2][1:])
         user_id = int(parts[-3])
+        dimension_id = int(parts[-4])
     else:
         subscription_id = None
         user_id = int(parts[-2])
+        dimension_id = int(parts[-3])
 
     back_cb = (
         f'admin_user_sub_select_{user_id}_{subscription_id}'
@@ -4524,13 +4531,15 @@ async def set_user_wl_traffic_button(callback: types.CallbackQuery, db_user: Use
         else f'admin_user_subscription_{user_id}'
     )
 
-    success = await _update_user_wl_traffic(db, user_id, traffic_gb, db_user.id, subscription_id=subscription_id)
+    spec = await _find_dimension_spec(db, dimension_id)
+    success = spec is not None and await _update_user_dimension_traffic(
+        db, user_id, spec, traffic_gb, db_user.id, subscription_id=subscription_id
+    )
 
+    label = spec.label() if spec else 'Измерение'
     traffic_text = '♾️ безлимитный' if traffic_gb == 0 else f'{traffic_gb} ГБ'
     message_text = (
-        f'✅ WL (БС) лимит трафика изменен на: {traffic_text}'
-        if success
-        else '❌ Ошибка изменения WL (БС) лимита трафика'
+        f'✅ {label}: лимит трафика изменён на {traffic_text}' if success else f'❌ Ошибка изменения лимита ({label})'
     )
     await callback.message.edit_text(
         message_text,
@@ -4543,12 +4552,15 @@ async def set_user_wl_traffic_button(callback: types.CallbackQuery, db_user: Use
 
 @admin_required
 @error_handler
-async def process_wl_traffic_edit_text(message: types.Message, db_user: User, state: FSMContext, db: AsyncSession):
+async def process_dimension_traffic_edit_text(
+    message: types.Message, db_user: User, state: FSMContext, db: AsyncSession
+):
     data = await state.get_data()
-    user_id = data.get('editing_wl_traffic_user_id')
+    user_id = data.get('editing_dimension_user_id')
+    dimension_id = data.get('editing_dimension_id')
     subscription_id = data.get('admin_subscription_id')
 
-    if not user_id:
+    if not user_id or not dimension_id:
         await message.answer('❌ Ошибка: пользователь не найден')
         await state.clear()
         return
@@ -4561,35 +4573,65 @@ async def process_wl_traffic_edit_text(message: types.Message, db_user: User, st
 
     try:
         traffic_gb = int(message.text.strip())
-
-        if traffic_gb < 0 or traffic_gb > 10000:
-            await message.answer('❌ WL-лимит трафика должен быть от 0 до 10000 ГБ (0 = безлимит)')
-            return
-
-        success = await _update_user_wl_traffic(db, user_id, traffic_gb, db_user.id, subscription_id=subscription_id)
-
-        if success:
-            traffic_text = '♾️ безлимитный' if traffic_gb == 0 else f'{traffic_gb} ГБ'
-            await message.answer(
-                f'✅ WL (БС) лимит трафика изменен на: {traffic_text}',
-                reply_markup=types.InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [types.InlineKeyboardButton(text='📱 Подписка и настройки', callback_data=back_cb)]
-                    ]
-                ),
-            )
-        else:
-            await message.answer('❌ Ошибка изменения WL (БС) лимита трафика')
-
     except ValueError:
         await message.answer('❌ Введите корректное число ГБ')
         return
 
+    if traffic_gb < 0 or traffic_gb > MAX_DIMENSION_LIMIT_GB:
+        await message.answer(f'❌ Лимит трафика должен быть от 0 до {MAX_DIMENSION_LIMIT_GB} ГБ (0 = безлимит)')
+        return
+
+    spec = await _find_dimension_spec(db, dimension_id)
+    success = spec is not None and await _update_user_dimension_traffic(
+        db, user_id, spec, traffic_gb, db_user.id, subscription_id=subscription_id
+    )
+
+    label = spec.label() if spec else 'Измерение'
+    if success:
+        traffic_text = '♾️ безлимитный' if traffic_gb == 0 else f'{traffic_gb} ГБ'
+        await message.answer(
+            f'✅ {label}: лимит трафика изменён на {traffic_text}',
+            reply_markup=types.InlineKeyboardMarkup(
+                inline_keyboard=[[types.InlineKeyboardButton(text='📱 Подписка и настройки', callback_data=back_cb)]]
+            ),
+        )
+    else:
+        await message.answer(f'❌ Ошибка изменения лимита ({label})')
+
     await state.clear()
 
 
-async def _update_user_wl_traffic(
-    db: AsyncSession, user_id: int, traffic_gb: int, admin_id: int, subscription_id: int | None = None
+async def _find_dimension_spec(db: AsyncSession, dimension_id: int | None):
+    if not dimension_id:
+        return None
+    for spec in await traffic_dimensions.all(db):
+        if spec.id == dimension_id:
+            return spec
+    return None
+
+
+def _extract_admin_dimension_context(callback_data: str) -> tuple[int | None, int | None, int | None]:
+    """Разбирает `admin_user_dim_traffic_{dimension_id}_{user_id}[_s{sub_id}]`."""
+    parts = callback_data.split('_')
+    subscription_id = None
+    if parts[-1].startswith('s') and parts[-1][1:].isdigit():
+        subscription_id = int(parts[-1][1:])
+        parts = parts[:-1]
+    try:
+        user_id = int(parts[-1])
+        dimension_id = int(parts[-2])
+    except (ValueError, IndexError):
+        return None, None, subscription_id
+    return dimension_id, user_id, subscription_id
+
+
+async def _update_user_dimension_traffic(
+    db: AsyncSession,
+    user_id: int,
+    spec,
+    traffic_gb: int,
+    admin_id: int,
+    subscription_id: int | None = None,
 ) -> bool:
     try:
         user = await get_user_by_id(db, user_id)
@@ -4598,24 +4640,28 @@ async def _update_user_wl_traffic(
             logger.error('Пользователь или подписка не найдены', user_id=user_id)
             return False
 
-        old_traffic = subscription.wl_traffic_limit_gb
-        subscription.wl_traffic_limit_gb = traffic_gb
+        row = await ensure_dimension_row(db, subscription, spec)
+        old_traffic = row.base_limit_gb
+        row.base_limit_gb = traffic_gb
         subscription.updated_at = datetime.now(UTC)
 
         await db.commit()
 
-        # WL-лимит информационный: в панели RemnaWave нет пер-инбаунд лимита, поэтому push отсутствует.
+        # Лимит измерения в панель не уходит: пер-инбаунд лимита там нет.
+        # Разблокировку делает реконсилятор — он каждый цикл пересчитывает
+        # решение и сам снимет блокировку, когда лимит подняли выше расхода.
         logger.info(
-            'Админ изменил WL (БС) лимит трафика пользователя',
+            'Админ изменил лимит измерения трафика',
             admin_id=admin_id,
             user_id=user_id,
-            old_wl_traffic=old_traffic,
-            wl_traffic=traffic_gb,
+            dimension=spec.key,
+            old_limit_gb=old_traffic,
+            limit_gb=traffic_gb,
         )
         return True
 
     except Exception as e:
-        logger.error('Ошибка обновления WL лимита трафика', error=e)
+        logger.error('Ошибка обновления лимита измерения трафика', dimension=getattr(spec, 'key', None), error=e)
         await db.rollback()
         return False
 
@@ -6694,11 +6740,14 @@ def register_handlers(dp: Dispatcher):
 
     dp.message.register(process_traffic_edit_text, AdminStates.editing_user_traffic)
 
+    # Порядок важен: `admin_user_dim_traffic_set_` — префикс `admin_user_dim_traffic_`,
+    # поэтому общий обработчик исключает `set` так же, как это сделано для обычного трафика.
     dp.callback_query.register(
-        start_wl_traffic_edit, F.data.startswith('admin_user_wl_traffic_') & ~F.data.contains('set')
+        start_dimension_traffic_edit,
+        F.data.startswith('admin_user_dim_traffic_') & ~F.data.contains('set'),
     )
-    dp.callback_query.register(set_user_wl_traffic_button, F.data.startswith('admin_user_wl_traffic_set_'))
-    dp.message.register(process_wl_traffic_edit_text, AdminStates.editing_user_wl_traffic)
+    dp.callback_query.register(set_user_dimension_traffic_button, F.data.startswith('admin_user_dim_traffic_set_'))
+    dp.message.register(process_dimension_traffic_edit_text, AdminStates.editing_user_dimension_traffic)
 
     dp.callback_query.register(
         confirm_reset_devices, F.data.startswith('admin_user_reset_devices_') & ~F.data.contains('confirm')

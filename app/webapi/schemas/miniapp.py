@@ -555,6 +555,15 @@ class MiniAppTariff(BaseModel):
     daily_price_label: str | None = None
 
 
+class MiniAppTrafficGrant(BaseModel):
+    """Одно начисление пакета: сколько ГБ и какому измерению."""
+
+    dimension: str
+    label: str
+    gb: int
+    is_base: bool = False
+
+
 class MiniAppTrafficTopupPackage(BaseModel):
     """Пакет докупки трафика."""
 
@@ -565,6 +574,12 @@ class MiniAppTrafficTopupPackage(BaseModel):
     original_price_kopeks: int | None = None
     original_price_label: str | None = None
     discount_percent: int = 0
+    # Пакет может начислять несколько измерений сразу — одного числа `gb` для
+    # его описания не хватает. Поля добавлены, а не заменяют старые: клиенты,
+    # читающие только `gb`, продолжают работать, а `gb` равен сумме начислений.
+    id: str | None = None
+    title: str | None = None
+    grants: list[MiniAppTrafficGrant] = Field(default_factory=list)
 
 
 class MiniAppCurrentTariff(BaseModel):
@@ -598,7 +613,10 @@ class MiniAppTrafficTopupRequest(BaseModel):
 
     init_data: str = Field(..., alias='initData')
     subscription_id: int | None = Field(None, alias='subscriptionId')
-    gb: int
+    gb: int = 0
+    # Пакет с начислениями по измерениям адресуется идентификатором: числом ГБ
+    # его не выразить. Когда задан, `gb` игнорируется.
+    package_id: str | None = Field(None, alias='packageId', max_length=64)
 
 
 class MiniAppTrafficTopupResponse(BaseModel):

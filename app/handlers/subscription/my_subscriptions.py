@@ -21,6 +21,7 @@ from app.database.crud.subscription import (
 from app.database.models import Subscription, SubscriptionStatus, User
 from app.localization.texts import Texts, get_texts
 from app.services.subscription_service import SubscriptionService
+from app.services.traffic_dimensions import format_extra_dimension_lines
 
 
 logger = structlog.get_logger(__name__)
@@ -214,14 +215,9 @@ async def show_subscription_detail(
         used = f'{subscription.traffic_used_gb:.1f}' if subscription.traffic_used_gb else '0'
         traffic = f'{used} / {subscription.traffic_limit_gb} ГБ'
 
-    # WL (БС) трафик
-    wl_line = ''
-    if settings.WL_TRAFFIC_ENABLED:
-        wl_used = f'{subscription.wl_traffic_used_gb:.1f}' if subscription.wl_traffic_used_gb else '0'
-        if (subscription.wl_traffic_limit_gb or 0) == 0:
-            wl_line = f'⚪ WL Трафик (БС): {wl_used} / ∞ ГБ\n'
-        else:
-            wl_line = f'⚪ WL Трафик (БС): {wl_used} / {subscription.wl_traffic_limit_gb} ГБ\n'
+    # Измерения трафика сверх обычного (WL и заведённые администратором)
+    extra_lines = await format_extra_dimension_lines(db, subscription, db_user.language)
+    wl_line = ''.join(f'{line}\n' for line in extra_lines)
 
     end_date = subscription.end_date.strftime('%d.%m.%Y %H:%M') if subscription.end_date else '—'
     status = subscription.status_display

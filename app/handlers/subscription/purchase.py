@@ -47,6 +47,7 @@ from app.services.subscription_checkout_service import (
     should_offer_checkout_resume,
 )
 from app.services.subscription_service import SubscriptionService
+from app.services.traffic_dimensions import format_extra_dimension_lines
 from app.services.trial_activation_service import (
     TrialPaymentChargeFailed,
     TrialPaymentInsufficientFunds,
@@ -301,19 +302,13 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
             '{used} / {limit} ГБ',
         ).format(used=used_traffic, limit=subscription.traffic_limit_gb)
 
-    # WL (БС) трафик: считаем «вживую» из пер-инбаунд статистики панели,
-    # с откатом на кэш подписки, если панель недоступна/фича не сработала.
-    wl_traffic_display = ''
-    if settings.WL_TRAFFIC_ENABLED:
-        try:
-            wl_stats = await RemnaWaveService().get_user_wl_traffic_stats(subscription)
-        except Exception as e:
-            logger.warning('Ошибка получения WL (БС) трафика', error=e)
-            wl_stats = {'enabled': False, 'wl_used_gb': 0.0}
-        wl_used_gb = wl_stats['wl_used_gb'] if wl_stats.get('enabled') else (subscription.wl_traffic_used_gb or 0.0)
-        wl_limit_gb = int(getattr(subscription, 'wl_traffic_limit_gb', 0) or 0)
-        wl_limit_display = '∞' if wl_limit_gb <= 0 else str(wl_limit_gb)
-        wl_traffic_display = f'{wl_used_gb:.1f} / {wl_limit_display} ГБ'
+    # Измерения трафика сверх обычного (WL и заведённые администратором)
+    try:
+        extra_dimension_lines = await format_extra_dimension_lines(db, subscription, db_user.language)
+    except Exception as e:
+        logger.warning('Ошибка получения измерений трафика', error=e)
+        extra_dimension_lines = []
+    extra_traffic_display = '\n'.join(extra_dimension_lines)
 
     devices_used_str = '—'
     devices_list = []
@@ -484,12 +479,14 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
 📱 Устройства: {devices_used} / {device_limit}""",
         )
 
-    if wl_traffic_display and '{traffic}' in message_template:
+    if extra_traffic_display and '{traffic}' in message_template and '{extra_traffic}' not in message_template:
         # Шаблон может приходить из локали (любого языка), поэтому цепляемся
-        # к плейсхолдеру {traffic}, а не к русскому тексту строки.
+        # к плейсхолдеру {traffic}, а не к русскому тексту строки. Заголовок и
+        # иконка каждого измерения приходят из его строки в реестре, поэтому
+        # здесь ничего про WL не зашито.
         message_template = message_template.replace(
             '{traffic}',
-            '{traffic}\n⚪ WL Трафик (БС): {wl_traffic}',
+            '{traffic}\n{extra_traffic}',
             1,
         )
 
@@ -512,7 +509,9 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
         end_date=format_local_datetime(subscription.end_date, '%d.%m.%Y %H:%M'),
         time_left=time_left_text,
         traffic=traffic_used_display,
-        wl_traffic=wl_traffic_display,
+        extra_traffic=extra_traffic_display,
+        # Совместимость: кастомные шаблоны могли ссылаться на {wl_traffic}.
+        wl_traffic=extra_traffic_display,
         servers=servers_display,
         devices_used=devices_used_str,
         device_limit=device_limit_display,

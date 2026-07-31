@@ -2,7 +2,7 @@ import asyncio
 import re
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import asdict, is_dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -35,6 +35,14 @@ from app.external.remnawave_api import (
     is_user_not_found_error,
 )
 from app.services.subscription_service import get_traffic_reset_strategy
+from app.services.traffic_dimension_enforcement import dimension_squad_policy, merge_panel_squads
+from app.services.traffic_dimension_meter import (
+    BYTES_IN_GB,
+    InboundUsageMatrix,
+    InboundUsageReading,
+    panel_history_floor,
+    parse_inbound_usage,
+)
 from app.utils.subscription_utils import (
     coerce_panel_device_limit,
     device_limit_needs_heal,
@@ -1510,6 +1518,7 @@ class RemnaWaveService:
                                     db_user,
                                     panel_user,
                                     open_grace_ids=open_grace_ids,
+                                    api=api,
                                 )
                                 stats['updated'] += 1
                                 logger.info('♻️ Обновлена подписка существующего пользователя', telegram_id=telegram_id)
@@ -1556,6 +1565,7 @@ class RemnaWaveService:
                                 db_user,
                                 panel_user,
                                 open_grace_ids=open_grace_ids,
+                                api=api,
                             )
                         else:
                             await self._create_subscription_from_panel_data(db, db_user, panel_user)
@@ -1677,6 +1687,7 @@ class RemnaWaveService:
                                     db_user,
                                     panel_user,
                                     open_grace_ids=open_grace_ids,
+                                    api=api,
                                 )
                             else:
                                 await self._create_subscription_from_panel_data(db, db_user, panel_user)
@@ -2316,7 +2327,11 @@ class RemnaWaveService:
         panel_user,
         *,
         open_grace_ids: set[int] | None = None,
+        api: Any = None,
     ):
+        # api: уже открытый клиент панели вызывающего цикла. Без него каждое
+        # пер-инбаунд измерение поднимало бы собственную aiohttp-сессию на
+        # пользователя — по одной на каждого за проход синхронизации.
         try:
             from app.database.crud.subscription import get_subscription_by_user_id, is_recently_updated_by_webhook
             from app.database.models import SubscriptionStatus
@@ -2446,12 +2461,10 @@ class RemnaWaveService:
                 subscription.traffic_used_gb = traffic_used_gb
                 logger.debug('Обновлен использованный трафик', traffic_used_gb=traffic_used_gb)
 
-            # WL (БС) трафик: обновляем кэш из пер-инбаунд статистики панели (если фича включена)
-            if settings.WL_TRAFFIC_ENABLED:
-                wl_stats = await self.get_user_wl_traffic_stats(subscription)
-                if abs((subscription.wl_traffic_used_gb or 0.0) - wl_stats['wl_used_gb']) > 0.01:
-                    subscription.wl_traffic_used_gb = wl_stats['wl_used_gb']
-                    logger.debug('Обновлен WL (БС) трафик', wl_traffic_used_gb=wl_stats['wl_used_gb'])
+            # Измерения трафика (WL и заведённые администратором) считает
+            # traffic_dimension_meter по собственному леджеру наблюдений: панель
+            # раз в неделю чистит пер-инбаунд историю, поэтому окно длиннее недели
+            # по ней не восстановить, и синк тут не источник правды.
 
             # traffic_limit_gb, device_limit: bot is source of truth, do not overwrite from panel
 
@@ -2464,6 +2477,17 @@ class RemnaWaveService:
                         panel_squad_uuids.append(squad['uuid'])
                     elif isinstance(squad, str):
                         panel_squad_uuids.append(squad)
+
+            # Сквады, снятые из-за исчерпанного измерения трафика, в панели
+            # отсутствуют намеренно. Простое присваивание стёрло бы их из права
+            # подписки навсегда: первая же синхронизация после блокировки
+            # прочитала бы урезанный список как новую истину, и разблокировать
+            # было бы уже нечего. Поэтому снятое возвращается в множество.
+            panel_squad_uuids = merge_panel_squads(
+                panel_squad_uuids,
+                subscription.connected_squads,
+                dimension_squad_policy.stripped_for(subscription.remnawave_uuid or ''),
+            )
 
             if (
                 not grace_open
@@ -2841,59 +2865,122 @@ class RemnaWaveService:
             logger.error('Ошибка получения статистики трафика по UUID', remnawave_uuid=remnawave_uuid, error=e)
             return None
 
-    async def compute_user_wl_traffic_bytes(self, remnawave_uuid: str, start_date: str, end_date: str) -> int:
-        """Суммирует трафик пользователя по WL-инбаундам за период [start_date, end_date].
+    async def read_inbound_usage(
+        self,
+        remnawave_uuid: str,
+        start_date: date,
+        end_date: date,
+        *,
+        api: Any = None,
+    ) -> InboundUsageReading:
+        """Читает пер-инбаунд трафик пользователя за окно [start_date, end_date] (UTC-сутки).
 
-        WL-инбаунды задаются глобально (settings.WL_INBOUND_UUIDS). Требует панель
-        RemnaWave с пер-инбаунд учётом трафика на пользователя. При недоступности
-        эндпоинта (обычная панель) или ошибке возвращает 0 (мягкая деградация).
+        Возвращает посуточную матрицу вместе с флагом `known`. Недоступная панель,
+        отсутствующий эндпоинт (обычная панель без пер-инбаунд учёта) или любая
+        другая ошибка дают `known=False` — это «мы не знаем», а не «трафика нет».
+        Единственный корректный ответ на `known=False` — сохранить предыдущее
+        решение, а не считать квоту освободившейся.
 
-        Даты в формате YYYY-MM-DD.
+        Окно подрезается снизу до даты, за которую панель ещё хранит историю
+        (см. TRAFFIC_DIMENSION_PANEL_HISTORY_TRUNCATE_WEEKDAY); тогда `truncated_window=True` и
+        значение заведомо занижено.
         """
-        wl_uuids = set(settings.get_wl_inbound_uuids())
-        if not wl_uuids or not remnawave_uuid:
-            return 0
+        floor = panel_history_floor(datetime.now(UTC).date(), settings.TRAFFIC_DIMENSION_PANEL_HISTORY_TRUNCATE_WEEKDAY)
+        covered_from = max(start_date, floor) if floor else start_date
+        empty = InboundUsageReading(
+            matrix=InboundUsageMatrix(),
+            known=False,
+            requested_from=start_date,
+            requested_to=end_date,
+            covered_from=covered_from,
+            truncated_window=covered_from > start_date,
+        )
+        if not remnawave_uuid:
+            return empty
+        if covered_from > end_date:
+            # Всё запрошенное окно уже вычищено панелью — данных нет в принципе.
+            return empty
+
         try:
-            async with self.get_api_client() as api:
-                data = await api.get_bandwidth_stats_user_inbounds(remnawave_uuid, start_date, end_date)
+            async with AsyncExitStack() as stack:
+                if api is None:
+                    api = await stack.enter_async_context(self.get_api_client())
+                data = await api.get_bandwidth_stats_user_inbounds(
+                    remnawave_uuid,
+                    covered_from.isoformat(),
+                    end_date.isoformat(),
+                )
         except Exception as e:
-            logger.warning('Failed to fetch WL per-inbound usage', remnawave_uuid=remnawave_uuid, error=e)
-            return 0
-        total = 0
-        for inbound in data.get('topInbounds', []) or []:
-            if str(inbound.get('uuid', '')).lower() in wl_uuids:
-                total += int(inbound.get('total') or 0)
-        return total
+            logger.warning('Failed to fetch per-inbound usage', remnawave_uuid=remnawave_uuid, error=e)
+            return InboundUsageReading(
+                matrix=InboundUsageMatrix(),
+                known=False,
+                requested_from=start_date,
+                requested_to=end_date,
+                covered_from=covered_from,
+                truncated_window=covered_from > start_date,
+                error=str(e),
+            )
 
-    async def get_user_wl_traffic_stats(self, subscription) -> dict[str, Any]:
-        """Живая статистика WL (БС) трафика для подписки.
+        return InboundUsageReading(
+            matrix=parse_inbound_usage(data),
+            known=True,
+            requested_from=start_date,
+            requested_to=end_date,
+            covered_from=covered_from,
+            truncated_window=covered_from > start_date,
+        )
 
-        Окно — текущий расчётный период: traffic_reset_at → сегодня (fallback на
-        start_date/created_at, иначе далёкое прошлое). Лимит берётся из подписки
-        (wl_traffic_limit_gb, 0 = безлимит). Всегда возвращает dict; при выключенной
-        фиче или ошибке used = 0.
+    async def measure_dimension_usage(
+        self,
+        subscription,
+        spec,
+        *,
+        window_start: date | None = None,
+        api: Any = None,
+    ) -> dict[str, Any]:
+        """Живое измерение одного измерения трафика для подписки.
+
+        Окно — `window_start` → сегодня (UTC-сутки); без него берётся начало
+        подписки. Всегда возвращает dict.
+
+        `known` говорит, удалось ли вообще измерить: панель могла не ответить или
+        окно целиком вычищено её недельной очисткой. `truncated_window` означает,
+        что панель отдала лишь часть периода, то есть `used_gb` заведомо занижен
+        и не должен затирать больший накопленный счётчик.
         """
-        wl_limit_gb = int(getattr(subscription, 'wl_traffic_limit_gb', 0) or 0)
-        result = {'wl_used_bytes': 0, 'wl_used_gb': 0.0, 'wl_limit_gb': wl_limit_gb, 'enabled': False}
-        if not settings.WL_TRAFFIC_ENABLED or not settings.get_wl_inbound_uuids():
+        result: dict[str, Any] = {
+            'used_bytes': 0,
+            'used_gb': 0.0,
+            'enabled': False,
+            'known': False,
+            'truncated_window': False,
+            'covered_from': None,
+        }
+        if spec is None or not spec.inbound_uuids:
             return result
 
         remnawave_uuid = getattr(subscription, 'remnawave_uuid', None)
         if not remnawave_uuid:
             return result
 
-        start_dt = (
-            getattr(subscription, 'traffic_reset_at', None)
-            or getattr(subscription, 'start_date', None)
-            or getattr(subscription, 'created_at', None)
-        )
-        start_str = start_dt.date().isoformat() if start_dt else '2020-01-01'
-        end_str = datetime.now(UTC).date().isoformat()
-
-        used_bytes = await self.compute_user_wl_traffic_bytes(remnawave_uuid, start_str, end_str)
         result['enabled'] = True
-        result['wl_used_bytes'] = used_bytes
-        result['wl_used_gb'] = used_bytes / (1024**3)
+
+        if window_start is None:
+            start_dt = getattr(subscription, 'start_date', None) or getattr(subscription, 'created_at', None)
+            window_start = start_dt.date() if start_dt else date(2020, 1, 1)
+        end_date = datetime.now(UTC).date()
+
+        reading = await self.read_inbound_usage(remnawave_uuid, window_start, end_date, api=api)
+        result['known'] = reading.known
+        result['truncated_window'] = reading.truncated_window
+        result['covered_from'] = reading.covered_from
+        if not reading.known:
+            return result
+
+        used_bytes = reading.total_for(spec.inbound_uuids)
+        result['used_bytes'] = used_bytes
+        result['used_gb'] = used_bytes / BYTES_IN_GB
         return result
 
     async def get_telegram_id_by_email(self, user_identifier: str) -> int | None:

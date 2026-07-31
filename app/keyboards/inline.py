@@ -2683,6 +2683,78 @@ def get_add_traffic_keyboard_from_tariff(
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def get_traffic_packages_keyboard_from_tariff(
+    language: str,
+    packages,  # Sequence[TrafficPackage]
+    dimension_labels: dict[str, str] | None = None,
+    subscription_end_date: datetime = None,
+    discount_percent: int = 0,
+    sub_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    """Клавиатура докупки для пакетов с начислениями по измерениям.
+
+    Отдельная от `get_add_traffic_keyboard_from_tariff` намеренно: у той
+    подпись строится из одного числа ГБ, а здесь пакет может выдавать сразу
+    несколько измерений, и в кнопке должно быть видно, что именно покупается.
+
+    Заголовки измерений приходят снаружи (`dimension_labels`): они задаются
+    администратором и живут в БД, а не в файлах локализации.
+    """
+    texts = get_texts(language)
+    language_code = (language or DEFAULT_LANGUAGE).split('-')[0].lower()
+    use_russian_fallback = language_code in {'ru', 'fa'}
+    back_cb = f'sm:{sub_id}' if sub_id and settings.is_multi_tariff_enabled() else 'menu_subscription'
+    labels = dimension_labels or {}
+
+    usable = [package for package in packages if package.enabled and package.price_kopeks > 0]
+    if not usable:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=texts.t('NO_TRAFFIC_PACKAGES', '❌ Нет доступных пакетов'),
+                        callback_data='no_traffic_packages',
+                    )
+                ],
+                [InlineKeyboardButton(text=texts.BACK, callback_data=back_cb)],
+            ]
+        )
+
+    unit = 'ГБ' if use_russian_fallback else 'GB'
+    period_text = ' /мес' if use_russian_fallback else ' /mo'
+    buttons = []
+
+    for package in sorted(usable, key=lambda p: (p.price_kopeks, p.total_gb)):
+        discounted_price, discount_value = apply_percentage_discount(package.price_kopeks, discount_percent)
+
+        if package.title:
+            # Название, заданное администратором, важнее сгенерированного.
+            body = package.title
+        else:
+            parts = []
+            for grant in package.grants:
+                label = labels.get(grant.dimension, grant.dimension)
+                if grant.is_base and grant.is_unlimited:
+                    parts.append('♾️' if use_russian_fallback else '♾️')
+                elif grant.is_base:
+                    parts.append(f'+{grant.gb} {unit}')
+                else:
+                    parts.append(f'+{grant.gb} {unit} {label}')
+            body = ' & '.join(parts)
+
+        text = f'📦 {body} - {discounted_price // 100} ₽{period_text}'
+        if discount_percent > 0 and discount_value > 0:
+            if use_russian_fallback:
+                text += f' (скидка {discount_percent}%: -{discount_value // 100}₽)'
+            else:
+                text += f' (discount {discount_percent}%: -{discount_value // 100}₽)'
+
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f'atp:{package.id}')])
+
+    buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=back_cb)])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def get_change_devices_keyboard(
     current_devices: int,
     language: str = DEFAULT_LANGUAGE,
