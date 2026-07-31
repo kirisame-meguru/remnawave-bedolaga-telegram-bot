@@ -2446,6 +2446,13 @@ class RemnaWaveService:
                 subscription.traffic_used_gb = traffic_used_gb
                 logger.debug('Обновлен использованный трафик', traffic_used_gb=traffic_used_gb)
 
+            # WL (БС) трафик: обновляем кэш из пер-инбаунд статистики панели (если фича включена)
+            if settings.WL_TRAFFIC_ENABLED:
+                wl_stats = await self.get_user_wl_traffic_stats(subscription)
+                if abs((subscription.wl_traffic_used_gb or 0.0) - wl_stats['wl_used_gb']) > 0.01:
+                    subscription.wl_traffic_used_gb = wl_stats['wl_used_gb']
+                    logger.debug('Обновлен WL (БС) трафик', wl_traffic_used_gb=wl_stats['wl_used_gb'])
+
             # traffic_limit_gb, device_limit: bot is source of truth, do not overwrite from panel
 
             # Update connected_squads from panel (panel is source of truth for squad assignments)
@@ -2833,6 +2840,61 @@ class RemnaWaveService:
         except Exception as e:
             logger.error('Ошибка получения статистики трафика по UUID', remnawave_uuid=remnawave_uuid, error=e)
             return None
+
+    async def compute_user_wl_traffic_bytes(self, remnawave_uuid: str, start_date: str, end_date: str) -> int:
+        """Суммирует трафик пользователя по WL-инбаундам за период [start_date, end_date].
+
+        WL-инбаунды задаются глобально (settings.WL_INBOUND_UUIDS). Требует панель
+        RemnaWave с пер-инбаунд учётом трафика на пользователя. При недоступности
+        эндпоинта (обычная панель) или ошибке возвращает 0 (мягкая деградация).
+
+        Даты в формате YYYY-MM-DD.
+        """
+        wl_uuids = set(settings.get_wl_inbound_uuids())
+        if not wl_uuids or not remnawave_uuid:
+            return 0
+        try:
+            async with self.get_api_client() as api:
+                data = await api.get_bandwidth_stats_user_inbounds(remnawave_uuid, start_date, end_date)
+        except Exception as e:
+            logger.warning('Failed to fetch WL per-inbound usage', remnawave_uuid=remnawave_uuid, error=e)
+            return 0
+        total = 0
+        for inbound in data.get('topInbounds', []) or []:
+            if str(inbound.get('uuid', '')).lower() in wl_uuids:
+                total += int(inbound.get('total') or 0)
+        return total
+
+    async def get_user_wl_traffic_stats(self, subscription) -> dict[str, Any]:
+        """Живая статистика WL (БС) трафика для подписки.
+
+        Окно — текущий расчётный период: traffic_reset_at → сегодня (fallback на
+        start_date/created_at, иначе далёкое прошлое). Лимит берётся из подписки
+        (wl_traffic_limit_gb, 0 = безлимит). Всегда возвращает dict; при выключенной
+        фиче или ошибке used = 0.
+        """
+        wl_limit_gb = int(getattr(subscription, 'wl_traffic_limit_gb', 0) or 0)
+        result = {'wl_used_bytes': 0, 'wl_used_gb': 0.0, 'wl_limit_gb': wl_limit_gb, 'enabled': False}
+        if not settings.WL_TRAFFIC_ENABLED or not settings.get_wl_inbound_uuids():
+            return result
+
+        remnawave_uuid = getattr(subscription, 'remnawave_uuid', None)
+        if not remnawave_uuid:
+            return result
+
+        start_dt = (
+            getattr(subscription, 'traffic_reset_at', None)
+            or getattr(subscription, 'start_date', None)
+            or getattr(subscription, 'created_at', None)
+        )
+        start_str = start_dt.date().isoformat() if start_dt else '2020-01-01'
+        end_str = datetime.now(UTC).date().isoformat()
+
+        used_bytes = await self.compute_user_wl_traffic_bytes(remnawave_uuid, start_str, end_str)
+        result['enabled'] = True
+        result['wl_used_bytes'] = used_bytes
+        result['wl_used_gb'] = used_bytes / (1024**3)
+        return result
 
     async def get_telegram_id_by_email(self, user_identifier: str) -> int | None:
         """

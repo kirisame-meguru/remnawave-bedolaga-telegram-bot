@@ -219,6 +219,14 @@ class Settings(BaseSettings):
     REMNAWAVE_AUTO_SYNC_TIMES: str = '03:00'
     CABINET_REMNA_SUB_CONFIG: str | None = None  # UUID конфига страницы подписки из RemnaWave
 
+    # WL (WhiteList / БС) трафик — отдельный счётчик трафика по выбранным инбаундам.
+    # Требует панель RemnaWave с пер-инбаунд учётом трафика на пользователя
+    # (инбаунды с trackTrafficPerUser). Трафик по всем WL-инбаундам суммируется
+    # в один счётчик и показывается строкой «WL Трафик (БС)» рядом с обычным трафиком.
+    WL_TRAFFIC_ENABLED: bool = False
+    WL_INBOUND_UUIDS: str = ''  # список UUID инбаундов через запятую (редактируется через пикер)
+    WL_TRAFFIC_DEFAULT_LIMIT_GB: int = 0  # 0 = безлимит; значение по умолчанию для новых подписок
+
     # RemnaWave incoming webhooks (real-time event delivery from backend)
     REMNAWAVE_WEBHOOK_ENABLED: bool = False
     REMNAWAVE_WEBHOOK_PATH: str = '/remnawave-webhook'
@@ -1913,6 +1921,16 @@ class Settings(BaseSettings):
             return []
         # Убираем комментарии (все после #)
         value = self.TRAFFIC_EXCLUDED_USER_UUIDS.split('#')[0].strip()
+        if not value:
+            return []
+        return [uuid.strip().lower() for uuid in value.split(',') if uuid.strip()]
+
+    def get_wl_inbound_uuids(self) -> list[str]:
+        """Возвращает список UUID инбаундов, засчитываемых как WL (БС) трафик."""
+        if not self.WL_INBOUND_UUIDS:
+            return []
+        # Убираем комментарии (все после #)
+        value = self.WL_INBOUND_UUIDS.split('#')[0].strip()
         if not value:
             return []
         return [uuid.strip().lower() for uuid in value.split(',') if uuid.strip()]

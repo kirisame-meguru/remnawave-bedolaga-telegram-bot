@@ -39,7 +39,7 @@ from app.keyboards.inline import (
 from app.localization.texts import Texts, get_texts
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.pricing_engine import pricing_engine
-from app.services.remnawave_service import RemnaWaveConfigurationError
+from app.services.remnawave_service import RemnaWaveConfigurationError, RemnaWaveService
 from app.services.subscription_checkout_service import (
     clear_subscription_checkout_draft,
     get_subscription_checkout_draft,
@@ -301,6 +301,20 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
             '{used} / {limit} ГБ',
         ).format(used=used_traffic, limit=subscription.traffic_limit_gb)
 
+    # WL (БС) трафик: считаем «вживую» из пер-инбаунд статистики панели,
+    # с откатом на кэш подписки, если панель недоступна/фича не сработала.
+    wl_traffic_display = ''
+    if settings.WL_TRAFFIC_ENABLED:
+        try:
+            wl_stats = await RemnaWaveService().get_user_wl_traffic_stats(subscription)
+        except Exception as e:
+            logger.warning('Ошибка получения WL (БС) трафика', error=e)
+            wl_stats = {'enabled': False, 'wl_used_gb': 0.0}
+        wl_used_gb = wl_stats['wl_used_gb'] if wl_stats.get('enabled') else (subscription.wl_traffic_used_gb or 0.0)
+        wl_limit_gb = int(getattr(subscription, 'wl_traffic_limit_gb', 0) or 0)
+        wl_limit_display = '∞' if wl_limit_gb <= 0 else str(wl_limit_gb)
+        wl_traffic_display = f'{wl_used_gb:.1f} / {wl_limit_display} ГБ'
+
     devices_used_str = '—'
     devices_list = []
     devices_count = 0
@@ -317,8 +331,6 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
                 else None
             ) or db_user.remnawave_uuid
             if _device_uuid:
-                from app.services.remnawave_service import RemnaWaveService
-
                 service = RemnaWaveService()
 
                 async with service.get_api_client() as api:
@@ -472,6 +484,15 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
 📱 Устройства: {devices_used} / {device_limit}""",
         )
 
+    if wl_traffic_display and '{traffic}' in message_template:
+        # Шаблон может приходить из локали (любого языка), поэтому цепляемся
+        # к плейсхолдеру {traffic}, а не к русскому тексту строки.
+        message_template = message_template.replace(
+            '{traffic}',
+            '{traffic}\n⚪ WL Трафик (БС): {wl_traffic}',
+            1,
+        )
+
     if not show_devices:
         message_template = message_template.replace(
             '\n📱 Устройства: {devices_used} / {device_limit}',
@@ -491,6 +512,7 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
         end_date=format_local_datetime(subscription.end_date, '%d.%m.%Y %H:%M'),
         time_left=time_left_text,
         traffic=traffic_used_display,
+        wl_traffic=wl_traffic_display,
         servers=servers_display,
         devices_used=devices_used_str,
         device_limit=device_limit_display,

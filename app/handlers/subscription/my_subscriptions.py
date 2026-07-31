@@ -214,6 +214,15 @@ async def show_subscription_detail(
         used = f'{subscription.traffic_used_gb:.1f}' if subscription.traffic_used_gb else '0'
         traffic = f'{used} / {subscription.traffic_limit_gb} ГБ'
 
+    # WL (БС) трафик
+    wl_line = ''
+    if settings.WL_TRAFFIC_ENABLED:
+        wl_used = f'{subscription.wl_traffic_used_gb:.1f}' if subscription.wl_traffic_used_gb else '0'
+        if (subscription.wl_traffic_limit_gb or 0) == 0:
+            wl_line = f'⚪ WL Трафик (БС): {wl_used} / ∞ ГБ\n'
+        else:
+            wl_line = f'⚪ WL Трафик (БС): {wl_used} / {subscription.wl_traffic_limit_gb} ГБ\n'
+
     end_date = subscription.end_date.strftime('%d.%m.%Y %H:%M') if subscription.end_date else '—'
     status = subscription.status_display
 
@@ -222,6 +231,7 @@ async def show_subscription_detail(
         f'Статус: {status}\n'
         f'📊 Трафик: {traffic}\n'
         f'📱 Устройства: {Texts.format_device_limit(subscription.device_limit)}\n'
+        f'{wl_line}'
         f'📅 До: {end_date}\n'
     )
 
