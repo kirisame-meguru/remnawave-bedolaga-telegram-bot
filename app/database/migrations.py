@@ -136,16 +136,22 @@ async def _ensure_runtime_schema_guards() -> None:
 
 
 async def run_alembic_upgrade() -> None:
-    """Run ``alembic upgrade head``, handling fresh and legacy databases."""
+    """Run ``alembic upgrade heads``, handling fresh and legacy databases.
+
+    ``heads`` (plural) rather than ``head``: this fork carries its own migrations
+    on a separate alembic branch (see ``xb0001_add_wl_traffic_to_subscriptions``),
+    so the revision graph legitimately has more than one head once upstream adds
+    migrations of its own. ``head`` would raise MultipleHeads.
+    """
     import asyncio
 
     db_state = await _detect_db_state()
 
     if db_state == 'fresh':
-        logger.warning('Обнаружена пустая БД — создание схемы из моделей + stamp head')
+        logger.warning('Обнаружена пустая БД — создание схемы из моделей + stamp heads')
         await _bootstrap_fresh_db()
         await _ensure_runtime_schema_guards()
-        await _stamp_alembic_revision('head')
+        await _stamp_alembic_revision('heads')
         return
 
     if db_state == 'legacy':
@@ -158,14 +164,14 @@ async def run_alembic_upgrade() -> None:
     loop = asyncio.get_running_loop()
     # run_in_executor offloads to a thread where env.py can safely
     # call asyncio.run() to create its own event loop.
-    await loop.run_in_executor(None, command.upgrade, cfg, 'head')
+    await loop.run_in_executor(None, command.upgrade, cfg, 'heads')
     await _ensure_runtime_schema_guards()
     logger.info('Alembic миграции применены')
 
 
 async def stamp_alembic_head() -> None:
     """Stamp the DB as being at head without running migrations (for existing DBs)."""
-    await _stamp_alembic_revision('head')
+    await _stamp_alembic_revision('heads')
 
 
 async def _stamp_alembic_revision(revision: str) -> None:

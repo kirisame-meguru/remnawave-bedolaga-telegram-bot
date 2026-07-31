@@ -41,8 +41,8 @@ fix: ## Исправить код (ruff check --fix + format)
 	uv run ruff format .
 
 .PHONY: migrate
-migrate: ## Применить миграции (alembic upgrade head)
-	uv run alembic upgrade head
+migrate: ## Применить миграции (alembic upgrade heads)
+	uv run alembic upgrade heads
 
 .PHONY: migration
 migration: ## Создать миграцию (usage: make migration m="description")

@@ -1,0 +1,30 @@
+# Fork-only workflow. Upstream (BEDOLAGA-DEV) has no file by this name, so it
+# will never conflict when syncing — do not fold these steps into lint.yml.
+#
+# Catches the class of breakage that took prod down on 2026-07-31: an upstream
+# merge that is clean to git but collides with a fork migration's alembic
+# revision id.
+name: Alembic Guard
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  revision-graph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # The guard test is deliberately dependency-free (stdlib only) so it
+      # cannot be skipped by a broken dependency resolve.
+      - run: pip install pytest
+
+      - name: Check alembic revision graph
+        run: pytest tests/test_alembic_revision_graph.py -v --noconftest
