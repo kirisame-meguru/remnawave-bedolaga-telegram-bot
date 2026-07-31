@@ -5,6 +5,10 @@ on:
     branches: ['**']
   pull_request:
     branches: ['**']
+  # release.yml calls this as a reusable workflow (`uses: ./.github/workflows/lint.yml`).
+  # Without workflow_call the call is invalid and every `v*` tag push fails the
+  # Release workflow at startup, in 0s, before a single step runs.
+  workflow_call:
 
 jobs:
   lint:
