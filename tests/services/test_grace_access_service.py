@@ -14,10 +14,16 @@ from app.services.grace_access_service import (
     GraceCompletionReason,
     GracePanelOverlay,
     GracePanelSnapshot,
+    GracePanelTransitionConflict,
+    GracePanelTransitionPending,
     GraceReason,
     GraceRestoreOutcome,
     GraceSessionState,
     GraceStartDecision,
+    GraceSubscriptionKind,
+    billing_is_eligible,
+    build_incident_key,
+    classify_subscription_kind,
 )
 
 
@@ -97,7 +103,11 @@ class FakePanelGateway:
         self.applied_overlays: list[tuple[str, GracePanelOverlay]] = []
         self.restored_snapshots: list[tuple[str, GracePanelSnapshot]] = []
         self.applied_billing: list[GraceBillingState] = []
+        self.applied_billing_overlays: list[GracePanelOverlay] = []
         self.fail_overlay_attempts = 0
+        self.conflict_billing_attempts = 0
+        self.pending_billing_attempts = 0
+        self.pending_restore_attempts = 0
         self.restore_outcome = GraceRestoreOutcome.RESTORED
 
     async def read_snapshot(self, remnawave_uuid: str) -> GracePanelSnapshot | None:
@@ -129,6 +139,9 @@ class FakePanelGateway:
         expected_overlay: GracePanelOverlay,
     ) -> GraceRestoreOutcome:
         self.restored_snapshots.append((remnawave_uuid, snapshot))
+        if self.pending_restore_attempts > 0:
+            self.pending_restore_attempts -= 1
+            raise GracePanelTransitionPending
         if self.restore_outcome is GraceRestoreOutcome.RESTORED:
             self.snapshot = replace(
                 snapshot,
@@ -137,8 +150,20 @@ class FakePanelGateway:
             )
         return self.restore_outcome
 
-    async def apply_billing_state(self, billing: GraceBillingState) -> None:
+    async def apply_billing_state(
+        self,
+        billing: GraceBillingState,
+        *,
+        expected_overlay: GracePanelOverlay,
+    ) -> None:
         self.applied_billing.append(billing)
+        self.applied_billing_overlays.append(expected_overlay)
+        if self.conflict_billing_attempts > 0:
+            self.conflict_billing_attempts -= 1
+            raise GracePanelTransitionConflict('panel state changed outside grace')
+        if self.pending_billing_attempts > 0:
+            self.pending_billing_attempts -= 1
+            raise GracePanelTransitionPending
 
 
 class FakeBillingGateway:
@@ -186,30 +211,83 @@ def make_snapshot(
     )
 
 
+def make_policy(**changes) -> GraceAccessPolicy:
+    policy = GraceAccessPolicy(
+        duration=timedelta(days=3),
+        expired_squad_uuid=EXPIRED_SQUAD,
+        limited_squad_uuid=LIMITED_SQUAD,
+        traffic_bytes=GIB,
+    )
+    return replace(policy, **changes)
+
+
 def make_service(
     *,
     billing: GraceBillingState,
     snapshot: GracePanelSnapshot,
     clock: MutableClock,
+    policy: GraceAccessPolicy | None = None,
 ) -> tuple[GraceAccessService, MemoryGraceStore, FakePanelGateway, FakeBillingGateway]:
     store = MemoryGraceStore()
     panel = FakePanelGateway(snapshot)
     billing_gateway = FakeBillingGateway(billing)
-    policy = GraceAccessPolicy(
-        duration=timedelta(days=3),
-        expired_squad_uuid=EXPIRED_SQUAD,
-        limited_squad_uuid=LIMITED_SQUAD,
-        expired_traffic_bytes=GIB,
-        limited_traffic_bytes=GIB,
-    )
     service = GraceAccessService(
         store=store,
         panel=panel,
         billing=billing_gateway,
-        policy=policy,
+        policy=policy or make_policy(),
         clock=clock,
     )
     return service, store, panel, billing_gateway
+
+
+def test_subscription_kind_priority_and_feature_flags() -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+    regular = make_billing(status='expired', end_at=now)
+    trial = replace(regular, is_trial=True)
+    daily = replace(regular, is_daily=True)
+    free = replace(regular, is_free_tariff=True)
+    overlapping = replace(regular, is_trial=True, is_daily=True, is_free_tariff=True)
+
+    assert classify_subscription_kind(regular) is GraceSubscriptionKind.REGULAR_PAID
+    assert classify_subscription_kind(trial) is GraceSubscriptionKind.TRIAL
+    assert classify_subscription_kind(daily) is GraceSubscriptionKind.DAILY
+    assert classify_subscription_kind(free) is GraceSubscriptionKind.FREE
+    assert classify_subscription_kind(overlapping) is GraceSubscriptionKind.TRIAL
+
+    default_policy = make_policy()
+    assert billing_is_eligible(regular, GraceReason.EXPIRED, default_policy) is True
+    assert billing_is_eligible(trial, GraceReason.EXPIRED, default_policy) is False
+    assert billing_is_eligible(daily, GraceReason.EXPIRED, default_policy) is False
+    assert billing_is_eligible(free, GraceReason.EXPIRED, default_policy) is False
+
+    enabled_policy = make_policy(trial_enabled=True, daily_enabled=True, free_enabled=True)
+    assert billing_is_eligible(trial, GraceReason.EXPIRED, enabled_policy) is True
+    assert billing_is_eligible(daily, GraceReason.EXPIRED, enabled_policy) is True
+    assert billing_is_eligible(free, GraceReason.EXPIRED, enabled_policy) is True
+    assert billing_is_eligible(overlapping, GraceReason.EXPIRED, make_policy(daily_enabled=True)) is False
+    assert billing_is_eligible(overlapping, GraceReason.EXPIRED, make_policy(trial_enabled=True)) is True
+
+
+def test_limited_incident_key_tracks_end_limit_and_reset_timestamp() -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+    billing = make_billing(status='limited', end_at=now + timedelta(days=30))
+    unknown = build_incident_key(billing, GraceReason.LIMITED)
+
+    assert unknown.endswith(':unknown')
+    assert build_incident_key(billing, GraceReason.LIMITED) == unknown
+    assert (
+        build_incident_key(replace(billing, end_at=billing.end_at + timedelta(days=30)), GraceReason.LIMITED) != unknown
+    )
+    assert build_incident_key(replace(billing, traffic_limit_bytes=20 * GIB), GraceReason.LIMITED) != unknown
+    assert (
+        build_incident_key(
+            billing,
+            GraceReason.LIMITED,
+            last_traffic_reset_at=now,
+        )
+        != unknown
+    )
 
 
 @pytest.mark.asyncio
@@ -229,7 +307,7 @@ async def test_expired_grace_changes_only_panel_overlay() -> None:
     assert result.session.panel_before is snapshot
     assert result.session.overlay.status == 'ACTIVE'
     assert result.session.overlay.expire_at == now + timedelta(days=3)
-    assert result.session.overlay.traffic_limit_bytes == snapshot.traffic_limit_bytes
+    assert result.session.overlay.traffic_limit_bytes == snapshot.used_traffic_bytes + GIB
     assert result.session.overlay.squad_uuids == (EXPIRED_SQUAD,)
     assert len(panel.applied_overlays) == 1
     assert store.only_session().state is GraceSessionState.ACTIVE
@@ -395,6 +473,49 @@ async def test_timeout_restores_original_panel_values_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_limited_snapshot_restore_stays_restoring_while_panel_derives_status() -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+    clock = MutableClock(now)
+    billing = make_billing(
+        status='limited',
+        end_at=now + timedelta(days=20),
+        traffic_limit_bytes=10 * GIB,
+        used_traffic_bytes=10 * GIB,
+    )
+    snapshot = replace(
+        make_snapshot(
+            expire_at=billing.end_at,
+            traffic_limit_bytes=billing.traffic_limit_bytes,
+            used_traffic_bytes=billing.used_traffic_bytes,
+        ),
+        status='LIMITED',
+    )
+    service, store, panel, _ = make_service(billing=billing, snapshot=snapshot, clock=clock)
+    await service.start_if_eligible(billing, GraceReason.LIMITED)
+    panel.pending_restore_attempts = 1
+    clock.advance(timedelta(days=3, seconds=1))
+
+    pending = await service.reconcile()
+
+    assert pending.unchanged == 1
+    assert pending.errors == 0
+    assert pending.timed_out == 0
+    assert store.only_session().state is GraceSessionState.RESTORING
+    assert store.only_session().last_error is None
+
+    completed = await service.reconcile()
+
+    assert completed.timed_out == 1
+    assert completed.errors == 0
+    assert store.only_session().state is GraceSessionState.COMPLETED
+    assert store.only_session().completion_reason is GraceCompletionReason.TIMEOUT
+    assert panel.restored_snapshots == [
+        (PANEL_UUID, snapshot),
+        (PANEL_UUID, snapshot),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_payment_wins_over_grace_snapshot() -> None:
     now = datetime(2026, 7, 15, 12, tzinfo=UTC)
     clock = MutableClock(now)
@@ -479,6 +600,108 @@ async def test_canonical_squad_change_ends_grace_and_applies_fresh_billing() -> 
 
 
 @pytest.mark.asyncio
+async def test_limited_canonical_change_waits_without_error_then_completes() -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+    clock = MutableClock(now)
+    billing = make_billing(
+        status='limited',
+        end_at=now + timedelta(days=20),
+        traffic_limit_bytes=10 * GIB,
+        used_traffic_bytes=10 * GIB,
+    )
+    snapshot = replace(
+        make_snapshot(
+            expire_at=billing.end_at,
+            traffic_limit_bytes=billing.traffic_limit_bytes,
+            used_traffic_bytes=billing.used_traffic_bytes,
+        ),
+        status='LIMITED',
+    )
+    service, store, panel, billing_gateway = make_service(
+        billing=billing,
+        snapshot=snapshot,
+        clock=clock,
+    )
+    started = await service.start_if_eligible(billing, GraceReason.LIMITED)
+    assert started.session is not None
+
+    changed_billing = replace(
+        billing,
+        traffic_limit_bytes=20 * GIB,
+        squad_uuids=('55555555-5555-5555-5555-555555555555',),
+    )
+    billing_gateway.state = changed_billing
+    panel.pending_billing_attempts = 1
+    store.sessions[started.session.id] = replace(
+        store.only_session(),
+        last_error='RemnaWaveAPIError: invalid status LIMITED',
+    )
+
+    pending = await service.reconcile()
+
+    assert pending.unchanged == 1
+    assert pending.errors == 0
+    assert pending.conflicts == 0
+    assert store.only_session().state is GraceSessionState.ACTIVE
+    assert store.only_session().last_error is None
+    assert panel.applied_billing_overlays == [started.session.overlay]
+
+    completed = await service.reconcile()
+
+    assert completed.conflicts == 1
+    assert completed.errors == 0
+    assert store.only_session().state is GraceSessionState.COMPLETED
+    assert store.only_session().completion_reason is GraceCompletionReason.CONFLICT
+    assert panel.applied_billing == [changed_billing, changed_billing]
+    assert panel.applied_billing_overlays == [
+        started.session.overlay,
+        started.session.overlay,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_limited_transition_conflict_completes_without_retry_error() -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+    clock = MutableClock(now)
+    billing = make_billing(
+        status='limited',
+        end_at=now + timedelta(days=20),
+        traffic_limit_bytes=10 * GIB,
+        used_traffic_bytes=10 * GIB,
+    )
+    snapshot = replace(
+        make_snapshot(
+            expire_at=billing.end_at,
+            traffic_limit_bytes=billing.traffic_limit_bytes,
+            used_traffic_bytes=billing.used_traffic_bytes,
+        ),
+        status='LIMITED',
+    )
+    service, store, panel, billing_gateway = make_service(
+        billing=billing,
+        snapshot=snapshot,
+        clock=clock,
+    )
+    started = await service.start_if_eligible(billing, GraceReason.LIMITED)
+    assert started.session is not None
+
+    changed_billing = replace(billing, traffic_limit_bytes=20 * GIB)
+    billing_gateway.state = changed_billing
+    panel.conflict_billing_attempts = 1
+
+    result = await service.reconcile()
+
+    assert result.conflicts == 1
+    assert result.errors == 0
+    completed = store.only_session()
+    assert completed.state is GraceSessionState.COMPLETED
+    assert completed.completion_reason is GraceCompletionReason.CONFLICT
+    assert completed.last_error == 'GracePanelTransitionConflict: panel state changed outside grace'
+    assert panel.applied_billing == [changed_billing]
+    assert panel.applied_billing_overlays == [started.session.overlay]
+
+
+@pytest.mark.asyncio
 async def test_webhook_suppression_matches_only_grace_echo() -> None:
     now = datetime(2026, 7, 15, 12, tzinfo=UTC)
     clock = MutableClock(now)
@@ -515,7 +738,7 @@ async def test_webhook_suppression_matches_only_grace_echo() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unlimited_panel_limit_remains_unlimited() -> None:
+async def test_unlimited_panel_limit_becomes_exact_grace_quota_above_usage() -> None:
     now = datetime(2026, 7, 15, 12, tzinfo=UTC)
     clock = MutableClock(now)
     billing = make_billing(
@@ -534,7 +757,7 @@ async def test_unlimited_panel_limit_remains_unlimited() -> None:
     result = await service.start_if_eligible(billing, GraceReason.EXPIRED)
 
     assert result.session is not None
-    assert result.session.overlay.traffic_limit_bytes == 0
+    assert result.session.overlay.traffic_limit_bytes == 51 * GIB
 
 
 @pytest.mark.asyncio
@@ -644,6 +867,60 @@ async def test_limited_grace_fails_closed_when_panel_omits_usage() -> None:
 
     assert store.sessions == {}
     assert panel.applied_overlays == []
+
+
+@pytest.mark.asyncio
+async def test_expired_grace_fails_closed_when_panel_omits_usage() -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+    clock = MutableClock(now)
+    billing = make_billing(status='expired', end_at=now)
+    snapshot = replace(
+        make_snapshot(
+            expire_at=billing.end_at,
+            traffic_limit_bytes=0,
+            used_traffic_bytes=0,
+        ),
+        status='EXPIRED',
+        traffic_is_known=False,
+    )
+    service, store, panel, _ = make_service(billing=billing, snapshot=snapshot, clock=clock)
+
+    with pytest.raises(ValueError, match='traffic usage'):
+        await service.start_if_eligible(billing, GraceReason.EXPIRED)
+
+    assert store.sessions == {}
+    assert panel.applied_overlays == []
+
+
+@pytest.mark.asyncio
+async def test_disabling_kind_flag_does_not_interrupt_an_open_session() -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+    clock = MutableClock(now)
+    billing = replace(
+        make_billing(status='expired', end_at=now - timedelta(minutes=1)),
+        is_trial=True,
+    )
+    snapshot = replace(make_snapshot(expire_at=billing.end_at), status='EXPIRED')
+    service, store, panel, billing_gateway = make_service(
+        billing=billing,
+        snapshot=snapshot,
+        clock=clock,
+        policy=make_policy(trial_enabled=True),
+    )
+    started = await service.start_if_eligible(billing, GraceReason.EXPIRED)
+    assert started.decision is GraceStartDecision.STARTED
+
+    service_after_restart = GraceAccessService(
+        store=store,
+        panel=panel,
+        billing=billing_gateway,
+        policy=make_policy(trial_enabled=False),
+        clock=clock,
+    )
+    result = await service_after_restart.reconcile()
+
+    assert result.unchanged == 1
+    assert store.only_session().state is GraceSessionState.ACTIVE
 
 
 @pytest.mark.asyncio

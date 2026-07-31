@@ -42,20 +42,14 @@ def _batch(**overrides) -> SimpleNamespace:
 # --- Wiring ----------------------------------------------------------------
 
 
-def test_coupon_routes_registered() -> None:
-    from app.cabinet.routes import router
-
-    methods_by_path: dict[str, set[str]] = {}
-    for route in router.routes:
-        if 'coupon' in route.path:
-            methods_by_path.setdefault(route.path, set()).update(route.methods)
-
-    assert methods_by_path.get('/cabinet/admin/coupons') == {'GET', 'POST'}
-    assert methods_by_path.get('/cabinet/admin/coupons/{batch_id}') == {'GET'}
-    assert methods_by_path.get('/cabinet/admin/coupons/{batch_id}/links') == {'GET'}
-    assert methods_by_path.get('/cabinet/admin/coupons/{batch_id}/revoke') == {'POST'}
-    assert methods_by_path.get('/cabinet/coupon/redeem') == {'POST'}
-    assert methods_by_path.get('/cabinet/coupon/{token}/status') == {'GET'}
+def test_coupon_routes_registered(registered_paths) -> None:
+    assert registered_paths.get('/cabinet/admin/coupons') == {'GET', 'POST'}
+    # DELETE — полное удаление партии (в отличие от /revoke, который гасит купоны)
+    assert registered_paths.get('/cabinet/admin/coupons/{batch_id}') == {'GET', 'DELETE'}
+    assert registered_paths.get('/cabinet/admin/coupons/{batch_id}/links') == {'GET'}
+    assert registered_paths.get('/cabinet/admin/coupons/{batch_id}/revoke') == {'POST'}
+    assert registered_paths.get('/cabinet/coupon/redeem') == {'POST'}
+    assert registered_paths.get('/cabinet/coupon/{token}/status') == {'GET'}
 
 
 def test_coupons_permissions_registered() -> None:
