@@ -2131,6 +2131,9 @@ class User(Base):
     created_at = Column(AwareDateTime(), default=func.now())
     updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now())
     last_activity = Column(AwareDateTime(), default=func.now())
+    # Панельный идентификатор пользователя (Remnawave 3.0.0: числовой id).
+    # remnawave_uuid оставлен как исторические данные, читается только одноразовым бэкфилом (восстановление идентичности).
+    remnawave_id = Column(BigInteger, nullable=True, unique=True, index=True)
     remnawave_uuid = Column(String(255), nullable=True, unique=True)
 
     # Cabinet authentication fields
@@ -2326,6 +2329,21 @@ class Subscription(Base):
             unique=True,
             postgresql_where=text("tariff_id IS NOT NULL AND status IN ('active', 'trial', 'limited')"),
         ),
+        # Панельная идентичность подписки. Уникальность частичная: непривязанных
+        # подписок (remnawave_id IS NULL) может быть сколько угодно, а вот две
+        # подписки на одного панельного пользователя — всегда ошибка. Код это и
+        # так предполагал (scalar_one_or_none в crud/user.py), но ничем не
+        # гарантировал; попутно снимает seq-scan с горячего webhook/grace-пути.
+        Index(
+            'uq_subscriptions_remnawave_id',
+            'remnawave_id',
+            unique=True,
+            postgresql_where=text('remnawave_id IS NOT NULL'),
+            sqlite_where=text('remnawave_id IS NOT NULL'),
+        ),
+        # shortUuid пережил 3.0.0 и остаётся единственным панельным ключом,
+        # которым можно резолвить строку, потерявшую связь.
+        Index('ix_subscriptions_remnawave_short_uuid', 'remnawave_short_uuid'),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -2376,6 +2394,10 @@ class Subscription(Base):
     grace_suppressed_until = Column(AwareDateTime(), nullable=True)
 
     remnawave_short_uuid = Column(String(255), nullable=True)
+    # Панельный идентификатор пользователя. С Remnawave 3.0.0 это числовой id —
+    # поле uuid из UsersSchema удалено. remnawave_uuid оставлен как исторические
+    # данные для аудита и разбора незарезолвленных строк; читается только одноразовым бэкфилом (восстановление идентичности).
+    remnawave_id = Column(BigInteger, nullable=True)
     remnawave_uuid = Column(String(255), nullable=True)
     remnawave_short_id = Column(
         String(16), nullable=False, unique=True, server_default=''
@@ -2643,7 +2665,13 @@ class GraceAccessSessionModel(Base):
 
     id = Column(String(36), primary_key=True)
     subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), nullable=False)
-    remnawave_uuid = Column(String(255), nullable=False)
+    # Панельная идентичность сессии (Remnawave 3.0.0: числовой id). Nullable на
+    # время бэкфила: колонку нельзя добавить сразу NOT NULL на живой таблице, а
+    # флип делается отдельной ревизией после проверки нулей.
+    remnawave_id = Column(BigInteger, nullable=True, index=True)
+    # Ослаблено до nullable в 0104: панель 3.0.0 не отдаёт uuid, поэтому новые
+    # сессии его физически не могут заполнить. Историческое поле.
+    remnawave_uuid = Column(String(255), nullable=True)
     reason = Column(String(16), nullable=False)
     incident_key = Column(String(255), nullable=False)
     state = Column(String(16), nullable=False)
@@ -2836,14 +2864,16 @@ class TrafficDimensionSample(Base):
 
     __tablename__ = 'traffic_dimension_samples'
     __table_args__ = (
-        UniqueConstraint('remnawave_uuid', 'inbound_uuid', 'usage_date', name='uq_traffic_dimension_sample'),
-        Index('ix_traffic_dimension_samples_uuid_date', 'remnawave_uuid', 'usage_date'),
+        UniqueConstraint('remnawave_id', 'inbound_uuid', 'usage_date', name='uq_traffic_dimension_sample'),
+        Index('ix_traffic_dimension_samples_panel_date', 'remnawave_id', 'usage_date'),
     )
 
     id = Column(Integer, primary_key=True, index=True)
-    # Ключ — панельный uuid, а не подписка: подписка может сменить remnawave_uuid,
-    # и старые наблюдения обязаны остаться валидной историей.
-    remnawave_uuid = Column(String(36), nullable=False)
+    # Ключ — панельный id пользователя, а не подписка: подписка может сменить
+    # панельного пользователя, и старые наблюдения обязаны остаться валидной
+    # историей. С 3.0.0 у записи пользователя в панели другого идентификатора
+    # и нет — поле uuid из UsersSchema удалено.
+    remnawave_id = Column(BigInteger, nullable=False)
     inbound_uuid = Column(String(36), nullable=False)
     usage_date = Column(Date, nullable=False)
     bytes = Column(BigInteger, nullable=False, server_default='0')
@@ -2964,6 +2994,9 @@ class PromoCode(Base):
 
     balance_bonus_kopeks = Column(Integer, default=0)
     subscription_days = Column(Integer, default=0)
+    # Гигабайты к подписке. Часть набора бонусов наравне с балансом и днями;
+    # 0 — трафик не начисляется.
+    traffic_gb = Column(Integer, default=0, server_default='0', nullable=False)
 
     max_uses = Column(Integer, default=1)
     current_uses = Column(Integer, default=0)
@@ -4750,6 +4783,10 @@ class GuestPurchase(Base):
     yandex_cid = Column(String(128), nullable=True)
     subid = Column(String(255), nullable=True)
     referrer = Column(String(500), nullable=True)
+    # Слаг рекламной кампании (``advertising_campaigns.start_parameter``).
+    # Оплату подтверждает вебхук платёжки, где куки и сессии покупателя уже
+    # нет, поэтому источник атрибуции хранится в самой покупке.
+    campaign_slug = Column(String(64), nullable=True)
 
     landing = relationship('LandingPage', back_populates='guest_purchases', lazy='selectin')
     tariff = relationship('Tariff', lazy='selectin')

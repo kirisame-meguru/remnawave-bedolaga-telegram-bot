@@ -40,7 +40,7 @@ def make_transition(action, *, applied=True, used_gb=12.0, user_id=1, reason=Non
     return SimpleNamespace(
         subscription_id=10,
         user_id=user_id,
-        remnawave_uuid='u-1',
+        remnawave_id=101,
         spec=SPEC,
         state=make_state(spec=SPEC, used_gb=used_gb, limit_gb=10),
         action=action,

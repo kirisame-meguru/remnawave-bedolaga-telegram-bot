@@ -153,7 +153,7 @@ def test_sample_rows_keeps_only_wanted_inbounds():
         },
         dates=(date(2026, 3, 10), date(2026, 3, 11)),
     )
-    rows = sample_rows_from_matrix('uuid-1', matrix, frozenset({'aaa'}), fetched_at=FETCHED_AT)
+    rows = sample_rows_from_matrix(101, matrix, frozenset({'aaa'}), fetched_at=FETCHED_AT)
     assert {(row['usage_date'], row['bytes']) for row in rows} == {
         (date(2026, 3, 10), 100),
         (date(2026, 3, 11), 200),
@@ -162,7 +162,7 @@ def test_sample_rows_keeps_only_wanted_inbounds():
 
 def test_sample_rows_drop_zero_cells():
     matrix = InboundUsageMatrix(cells={(date(2026, 3, 10), 'aaa'): 0}, dates=(date(2026, 3, 10),))
-    assert sample_rows_from_matrix('uuid-1', matrix, frozenset({'aaa'}), fetched_at=FETCHED_AT) == []
+    assert sample_rows_from_matrix(101, matrix, frozenset({'aaa'}), fetched_at=FETCHED_AT) == []
 
 
 def test_sample_rows_refuse_matrix_without_daily_series():
@@ -172,12 +172,13 @@ def test_sample_rows_refuse_matrix_without_daily_series():
         dates=(date(2026, 3, 11),),
         has_daily_series=False,
     )
-    assert sample_rows_from_matrix('uuid-1', matrix, frozenset({'aaa'}), fetched_at=FETCHED_AT) == []
+    assert sample_rows_from_matrix(101, matrix, frozenset({'aaa'}), fetched_at=FETCHED_AT) == []
 
 
-def test_sample_rows_need_uuid():
+def test_sample_rows_need_a_panel_id():
+    """Подписка без `remnawave_id` в журнал не пишется: ключа у наблюдения нет."""
     matrix = InboundUsageMatrix(cells={(date(2026, 3, 11), 'aaa'): 5}, dates=(date(2026, 3, 11),))
-    assert sample_rows_from_matrix('', matrix, frozenset({'aaa'}), fetched_at=FETCHED_AT) == []
+    assert sample_rows_from_matrix(None, matrix, frozenset({'aaa'}), fetched_at=FETCHED_AT) == []
 
 
 # ------------------------------ агрегаты ------------------------------

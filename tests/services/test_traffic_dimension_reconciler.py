@@ -48,6 +48,7 @@ TABLES = [
 
 SPEC = make_spec(inbounds=('aaa',))
 PLAN = plan_squad_strip(['sq-wl'], {'sq-wl': frozenset({'aaa'})}, frozenset({'aaa'}))
+PANEL_ID = 101
 
 
 @pytest.fixture(autouse=True)
@@ -95,7 +96,7 @@ async def seed(db, *, connected_squads=('sq-wl', 'sq-eu')) -> Subscription:
         status='active',
         start_date=datetime(2026, 3, 1, tzinfo=UTC),
         end_date=datetime(2026, 4, 1, tzinfo=UTC),
-        remnawave_uuid='u-1',
+        remnawave_id=PANEL_ID,
         connected_squads=list(connected_squads),
     )
     db.add(subscription)
@@ -141,7 +142,7 @@ async def test_observe_leaves_no_trace(monkeypatch):
 
         assert api.calls == [], 'наблюдение не пишет в панель'
         assert await state_rows(db) == [], 'наблюдение не заводит даже строк состояния'
-        assert dimension_squad_policy.blocked_uuids() == frozenset()
+        assert dimension_squad_policy.blocked_panel_ids() == frozenset()
         assert report.blocked == 1, 'посчитать всё равно надо — ради отчёта'
         assert len(report.transitions) == 1, 'видно, кого бы отрезало'
 
@@ -163,7 +164,7 @@ async def test_notify_records_without_touching_the_panel(monkeypatch):
         assert row['blocked_at'] is not None
         assert row['block_reason'] == BlockReason.QUOTA_EXHAUSTED.value
         assert not row['stripped_squads'], 'ничего не снято — восстанавливать нечего'
-        assert dimension_squad_policy.blocked_uuids() == frozenset()
+        assert dimension_squad_policy.blocked_panel_ids() == frozenset()
         assert len(report.transitions) == 1
 
 
@@ -180,10 +181,11 @@ async def test_enforce_strips_only_the_dimension_squad(monkeypatch):
         await db.commit()
 
         assert len(api.calls) == 1
+        assert api.calls[0]['user_id'] == PANEL_ID, 'панельный юзер адресуется числовым id'
         assert api.calls[0]['active_internal_squads'] == ['sq-eu'], 'обычный доступ остаётся'
         row = await state_row(db)
         assert row['stripped_squads'] == ['sq-wl']
-        assert dimension_squad_policy.stripped_for('u-1') == frozenset({'sq-wl'})
+        assert dimension_squad_policy.stripped_for(PANEL_ID) == frozenset({'sq-wl'})
         assert report.panel_writes == 1
 
 
@@ -218,7 +220,7 @@ async def test_failed_panel_write_does_not_pretend_access_is_closed(monkeypatch)
         row = await state_row(db)
         assert row['blocked_at'] is None
         assert row['block_reason'] is None
-        assert dimension_squad_policy.blocked_uuids() == frozenset()
+        assert dimension_squad_policy.blocked_panel_ids() == frozenset()
         assert report.panel_errors == 1
 
 
@@ -259,7 +261,7 @@ async def test_unblock_restores_the_full_entitlement(monkeypatch):
             block_allowed=True,
         )
         await db.commit()
-        assert dimension_squad_policy.stripped_for('u-1') == frozenset({'sq-wl'})
+        assert dimension_squad_policy.stripped_for(PANEL_ID) == frozenset({'sq-wl'})
 
         unblock = _PlannedChange(
             subscription=subscription,
@@ -274,7 +276,7 @@ async def test_unblock_restores_the_full_entitlement(monkeypatch):
         await db.commit()
 
         assert api.calls[-1]['active_internal_squads'] == ['sq-wl', 'sq-eu']
-        assert dimension_squad_policy.blocked_uuids() == frozenset()
+        assert dimension_squad_policy.blocked_panel_ids() == frozenset()
         row = await state_row(db)
         assert row['blocked_at'] is None
         assert row['stripped_squads'] == []
@@ -308,7 +310,7 @@ async def test_failed_unblock_keeps_the_filter(monkeypatch):
         await reconciler._apply(db, unblock, api=FakeApi(fail=True), report=report, block_allowed=True)
         await db.commit()
 
-        assert dimension_squad_policy.stripped_for('u-1') == frozenset({'sq-wl'})
+        assert dimension_squad_policy.stripped_for(PANEL_ID) == frozenset({'sq-wl'})
         row = await state_row(db)
         assert row['blocked_at'] is not None
 
@@ -394,7 +396,7 @@ async def test_publish_policy_rebuilds_the_map_from_the_database(monkeypatch):
         count = await TrafficDimensionReconciler().publish_policy(db)
 
         assert count == 1
-        assert dimension_squad_policy.stripped_for('u-1') == frozenset({'sq-wl'})
+        assert dimension_squad_policy.stripped_for(PANEL_ID) == frozenset({'sq-wl'})
 
 
 @pytest.mark.asyncio
@@ -415,4 +417,4 @@ async def test_publish_policy_ignores_unblocked_rows(monkeypatch):
         await db.commit()
 
         assert await TrafficDimensionReconciler().publish_policy(db) == 0
-        assert dimension_squad_policy.blocked_uuids() == frozenset()
+        assert dimension_squad_policy.blocked_panel_ids() == frozenset()

@@ -97,7 +97,7 @@ class DimensionTransition:
 
     subscription_id: int
     user_id: int
-    remnawave_uuid: str | None
+    remnawave_id: int | None
     spec: TrafficDimensionSpec
     state: DimensionState
     action: EnforcementAction
@@ -175,10 +175,10 @@ class TrafficDimensionReconciler:
 
     def __init__(self) -> None:
         self._notifier = None
-        # Последний отправленный в панель «щит» по каждому uuid. Только в
-        # памяти: после рестарта щит переставляется заново, что заодно чинит
-        # лимит, если его успел сбить кто-то ещё.
-        self._pushed_shield: dict[str, int] = {}
+        # Последний отправленный в панель «щит» по каждому панельному id.
+        # Только в памяти: после рестарта щит переставляется заново, что заодно
+        # чинит лимит, если его успел сбить кто-то ещё.
+        self._pushed_shield: dict[int, int] = {}
 
     def set_notifier(self, notifier) -> None:
         """Подключает доставку уведомлений (шаг 5).
@@ -342,8 +342,8 @@ class TrafficDimensionReconciler:
             if not desired:
                 # Безлимит: поднимать нечего.
                 continue
-            uuid = str(subscription.remnawave_uuid)
-            if self._pushed_shield.get(uuid) == desired:
+            panel_user_id = subscription.remnawave_id
+            if not panel_user_id or self._pushed_shield.get(panel_user_id) == desired:
                 continue
             from app.services.grace_access_runtime import update_panel_user_grace_safe
 
@@ -351,7 +351,7 @@ class TrafficDimensionReconciler:
                 await update_panel_user_grace_safe(
                     api,
                     subscription.id,
-                    uuid=subscription.remnawave_uuid,
+                    user_id=panel_user_id,
                     traffic_limit_bytes=desired,
                 )
             except Exception as e:
@@ -362,7 +362,7 @@ class TrafficDimensionReconciler:
                     error=e,
                 )
                 continue
-            self._pushed_shield[uuid] = desired
+            self._pushed_shield[panel_user_id] = desired
             report.shield_writes += 1
 
     async def _load_candidates(self, db: AsyncSession) -> list[Subscription]:
@@ -376,7 +376,7 @@ class TrafficDimensionReconciler:
             .options(selectinload(Subscription.tariff))
             .where(
                 Subscription.status.in_(_ENFORCED_STATUSES),
-                Subscription.remnawave_uuid.isnot(None),
+                Subscription.remnawave_id.isnot(None),
                 Subscription.id.in_(select(SubscriptionTrafficDimension.subscription_id).distinct()),
             )
             .order_by(Subscription.id)
@@ -448,7 +448,7 @@ class TrafficDimensionReconciler:
                 )
                 if applied:
                     row.stripped_squads = list(stripped)
-                    dimension_squad_policy.set_for(subscription.remnawave_uuid, stripped)
+                    dimension_squad_policy.set_for(subscription.remnawave_id, stripped)
                 else:
                     # В панель не доехало — не притворяемся, что доступ закрыт.
                     row.blocked_at = None
@@ -460,7 +460,7 @@ class TrafficDimensionReconciler:
             if report.mode is EnforcementMode.ENFORCE and previously:
                 # Снимаем фильтр до записи, иначе граница API вырежет ровно то,
                 # что мы возвращаем.
-                dimension_squad_policy.clear_for(subscription.remnawave_uuid)
+                dimension_squad_policy.clear_for(subscription.remnawave_id)
                 applied = await self._push_squads(
                     api,
                     subscription,
@@ -468,7 +468,7 @@ class TrafficDimensionReconciler:
                     report=report,
                 )
                 if not applied:
-                    dimension_squad_policy.set_for(subscription.remnawave_uuid, previously)
+                    dimension_squad_policy.set_for(subscription.remnawave_id, previously)
                     return
             row.blocked_at = None
             row.block_reason = None
@@ -501,7 +501,7 @@ class TrafficDimensionReconciler:
         return DimensionTransition(
             subscription_id=change.subscription.id,
             user_id=change.subscription.user_id,
-            remnawave_uuid=change.subscription.remnawave_uuid,
+            remnawave_id=change.subscription.remnawave_id,
             spec=change.spec,
             state=change.state,
             action=change.action,
@@ -527,7 +527,7 @@ class TrafficDimensionReconciler:
             await update_panel_user_grace_safe(
                 api,
                 subscription.id,
-                uuid=subscription.remnawave_uuid,
+                user_id=subscription.remnawave_id,
                 active_internal_squads=squads,
             )
         except Exception as e:
@@ -550,29 +550,30 @@ class TrafficDimensionReconciler:
         рестарта первая же посторонняя запись в панель вернула бы снятые сквады.
         """
         result = await db.execute(
-            select(Subscription.remnawave_uuid, SubscriptionTrafficDimension.stripped_squads)
+            select(Subscription.remnawave_id, SubscriptionTrafficDimension.stripped_squads)
             .join(
                 SubscriptionTrafficDimension,
                 SubscriptionTrafficDimension.subscription_id == Subscription.id,
             )
             .where(
                 SubscriptionTrafficDimension.blocked_at.isnot(None),
-                Subscription.remnawave_uuid.isnot(None),
+                Subscription.remnawave_id.isnot(None),
             )
         )
-        mapping: dict[str, set[str]] = {}
-        for remnawave_uuid, stripped in result.all():
-            if not remnawave_uuid or not stripped:
+        mapping: dict[int, set[str]] = {}
+        for panel_user_id, stripped in result.all():
+            if not panel_user_id or not stripped:
                 continue
-            mapping.setdefault(str(remnawave_uuid), set()).update(str(uuid).lower() for uuid in stripped)
+            mapping.setdefault(int(panel_user_id), set()).update(str(uuid).lower() for uuid in stripped)
 
         from app.services.grace_access_runtime import get_open_grace_subscription_ids
 
         grace_ids = await get_open_grace_subscription_ids(db)
         if grace_ids:
-            open_uuids = await db.execute(select(Subscription.remnawave_uuid).where(Subscription.id.in_(grace_ids)))
-            for remnawave_uuid in open_uuids.scalars().all():
-                mapping.pop(str(remnawave_uuid), None)
+            open_ids = await db.execute(select(Subscription.remnawave_id).where(Subscription.id.in_(grace_ids)))
+            for panel_user_id in open_ids.scalars().all():
+                if panel_user_id is not None:
+                    mapping.pop(int(panel_user_id), None)
 
         dimension_squad_policy.replace_all(mapping)
         return len(mapping)

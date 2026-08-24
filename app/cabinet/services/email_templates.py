@@ -145,8 +145,20 @@ class EmailNotificationTemplates:
         # Tier 3: Simple HTML fragment — use base template for structure
         return self._get_base_template(content, language)
 
-    def _get_base_template(self, content: str, language: str = 'ru') -> str:
-        """Wrap content in base HTML template."""
+    _UNSUBSCRIBE_TEXTS = {
+        'ru': 'Отписаться от рассылок',
+        'en': 'Unsubscribe from marketing emails',
+        'zh': '退订营销邮件',
+        'ua': 'Відписатися від розсилок',
+        'fa': 'لغو اشتراک ایمیل‌های تبلیغاتی',
+    }
+
+    def _get_base_template(self, content: str, language: str = 'ru', unsubscribe_url: str = '') -> str:
+        """Wrap content in base HTML template.
+
+        ``unsubscribe_url`` непустой только у маркетинговых писем — у писем со
+        сбросом пароля или чеком отписке взяться неоткуда.
+        """
         footer_texts = {
             'ru': 'Это автоматическое сообщение. Пожалуйста, не отвечайте на это письмо.',
             'en': 'This is an automated message. Please do not reply to this email.',
@@ -155,6 +167,14 @@ class EmailNotificationTemplates:
             'fa': 'این یک پیام خودکار است. لطفاً به این ایمیل پاسخ ندهید.',
         }
         footer_text = footer_texts.get(language, footer_texts['ru'])
+
+        unsubscribe_block = ''
+        if unsubscribe_url:
+            unsubscribe_label = self._UNSUBSCRIBE_TEXTS.get(language, self._UNSUBSCRIBE_TEXTS['ru'])
+            unsubscribe_block = (
+                f'<p><a href="{html.escape(unsubscribe_url, quote=True)}" '
+                f'style="color: #666;">{unsubscribe_label}</a></p>'
+            )
 
         return f"""
 <!DOCTYPE html>
@@ -247,6 +267,7 @@ class EmailNotificationTemplates:
         <div class="footer">
             <p>&copy; {self.service_name}</p>
             <p>{footer_text}</p>
+            {unsubscribe_block}
         </div>
     </div>
 </body>
@@ -873,7 +894,9 @@ class EmailNotificationTemplates:
         }
         return {
             'subject': subjects.get(language, subjects['ru']),
-            'body_html': self._get_base_template(bodies.get(language, bodies['ru']), language),
+            'body_html': self._get_base_template(
+                bodies.get(language, bodies['ru']), language, context.get('unsubscribe_url', '')
+            ),
         }
 
     def _winback_discount_template(self, language: str, context: dict[str, Any]) -> dict[str, str]:
@@ -894,7 +917,9 @@ class EmailNotificationTemplates:
         }
         return {
             'subject': subjects.get(language, subjects['ru']),
-            'body_html': self._get_base_template(bodies.get(language, bodies['ru']), language),
+            'body_html': self._get_base_template(
+                bodies.get(language, bodies['ru']), language, context.get('unsubscribe_url', '')
+            ),
         }
 
     def _winback_trial_ending_template(self, language: str, context: dict[str, Any]) -> dict[str, str]:
@@ -913,7 +938,9 @@ class EmailNotificationTemplates:
         }
         return {
             'subject': subjects.get(language, subjects['ru']),
-            'body_html': self._get_base_template(bodies.get(language, bodies['ru']), language),
+            'body_html': self._get_base_template(
+                bodies.get(language, bodies['ru']), language, context.get('unsubscribe_url', '')
+            ),
         }
 
     def _subscription_activated_template(self, language: str, context: dict[str, Any]) -> dict[str, str]:
@@ -1405,7 +1432,9 @@ class EmailNotificationTemplates:
 
         return {
             'subject': subjects.get(language, subjects['ru']),
-            'body_html': self._get_base_template(bodies.get(language, bodies['ru']), language),
+            'body_html': self._get_base_template(
+                bodies.get(language, bodies['ru']), language, context.get('unsubscribe_url', '')
+            ),
         }
 
     def _referral_registered_template(self, language: str, context: dict[str, Any]) -> dict[str, str]:

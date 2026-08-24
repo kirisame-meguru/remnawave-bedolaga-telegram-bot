@@ -724,7 +724,7 @@ async def _auto_extend_subscription(
         )
 
     # Send user notification only for Telegram users
-    if bot and user.telegram_id:
+    if bot and user.telegram_id and settings.is_notifications_enabled():
         try:
             auto_message = texts.t(
                 'AUTO_PURCHASE_SUBSCRIPTION_EXTENDED',
@@ -1098,7 +1098,7 @@ async def _auto_purchase_tariff(
         )
 
     # Send user notification only for Telegram users
-    if bot and user.telegram_id:
+    if bot and user.telegram_id and settings.is_notifications_enabled():
         try:
             texts = get_texts(getattr(user, 'language', 'ru'))
             period_label = format_period_description(period_days, getattr(user, 'language', 'ru'))
@@ -1461,7 +1461,7 @@ async def _auto_purchase_daily_tariff(
         )
 
     # Send user notification only for Telegram users
-    if bot and user.telegram_id:
+    if bot and user.telegram_id and settings.is_notifications_enabled():
         try:
             texts = get_texts(getattr(user, 'language', 'ru'))
 
@@ -1756,13 +1756,13 @@ async def _auto_add_devices(
         subscription_service = SubscriptionService()
         await subscription_service.update_remnawave_user(db, subscription)
         # Явно включаем пользователя на панели (PATCH может не снять LIMITED-статус)
-        _panel_uuid = (
-            subscription.remnawave_uuid
-            if settings.is_multi_tariff_enabled() and subscription.remnawave_uuid
-            else getattr(user, 'remnawave_uuid', None)
+        _panel_user_id = (
+            subscription.remnawave_id
+            if settings.is_multi_tariff_enabled() and subscription.remnawave_id is not None
+            else getattr(user, 'remnawave_id', None)
         )
-        if _panel_uuid and subscription.status == 'active':
-            await subscription_service.enable_remnawave_user(_panel_uuid)
+        if _panel_user_id is not None and subscription.status == 'active':
+            await subscription_service.enable_remnawave_user(_panel_user_id)
     except Exception as error:
         logger.warning(
             '⚠️ Автопокупка устройств: не удалось обновить Remnawave для пользователя',
@@ -1804,7 +1804,7 @@ async def _auto_add_devices(
         logger.warning('⚠️ Автопокупка устройств: не удалось отправить WebSocket уведомление', ws_error=ws_error)
 
     # Уведомление пользователю
-    if bot and user.telegram_id:
+    if bot and user.telegram_id and settings.is_notifications_enabled():
         texts = get_texts(getattr(user, 'language', 'ru'))
         try:
             message = texts.t(
@@ -2222,13 +2222,13 @@ async def _auto_add_traffic(
         subscription_service = SubscriptionService()
         await subscription_service.update_remnawave_user(db, subscription)
         # Явно включаем пользователя на панели (PATCH может не снять LIMITED-статус)
-        _panel_uuid = (
-            subscription.remnawave_uuid
-            if settings.is_multi_tariff_enabled() and subscription.remnawave_uuid
-            else getattr(user, 'remnawave_uuid', None)
+        _panel_user_id = (
+            subscription.remnawave_id
+            if settings.is_multi_tariff_enabled() and subscription.remnawave_id is not None
+            else getattr(user, 'remnawave_id', None)
         )
-        if _panel_uuid and subscription.status == 'active':
-            await subscription_service.enable_remnawave_user(_panel_uuid)
+        if _panel_user_id is not None and subscription.status == 'active':
+            await subscription_service.enable_remnawave_user(_panel_user_id)
     except Exception as error:
         logger.warning(
             '⚠️ Автопокупка трафика: не удалось обновить Remnawave для пользователя',
@@ -2270,7 +2270,7 @@ async def _auto_add_traffic(
         logger.warning('⚠️ Автопокупка трафика: не удалось отправить WebSocket уведомление', ws_error=ws_error)
 
     # User notification
-    if bot and user.telegram_id:
+    if bot and user.telegram_id and settings.is_notifications_enabled():
         texts = get_texts(getattr(user, 'language', 'ru'))
         try:
             message = texts.t(
@@ -2656,7 +2656,7 @@ async def try_auto_extend_expired_after_topup(
         )
 
     # Send user notification (only for Telegram users)
-    if bot and user.telegram_id:
+    if bot and user.telegram_id and settings.is_notifications_enabled():
         try:
             auto_message = texts.t(
                 'AUTO_PURCHASE_SUBSCRIPTION_EXTENDED',
@@ -2971,7 +2971,15 @@ async def try_resume_disabled_daily_after_topup(
     # Sync with RemnaWave
     try:
         subscription_service = SubscriptionService()
-        if getattr(user, 'remnawave_uuid', None):
+        # Multi-tariff keeps panel identity on the subscription, not the user —
+        # gating on the user column alone made every daily resume take the
+        # create branch and spawn a duplicate panel account.
+        _has_panel_user = (
+            getattr(subscription, 'remnawave_id', None)
+            if settings.is_multi_tariff_enabled()
+            else getattr(user, 'remnawave_id', None)
+        ) is not None
+        if _has_panel_user:
             await subscription_service.update_remnawave_user(
                 db,
                 subscription,
@@ -2988,7 +2996,12 @@ async def try_resume_disabled_daily_after_topup(
             )
             # POST may ignore activeInternalSquads — follow up with PATCH
             await db.refresh(user)
-            if getattr(user, 'remnawave_uuid', None) and subscription.connected_squads:
+            _synced_panel_user_id = (
+                getattr(subscription, 'remnawave_id', None)
+                if settings.is_multi_tariff_enabled()
+                else getattr(user, 'remnawave_id', None)
+            )
+            if _synced_panel_user_id is not None and subscription.connected_squads:
                 try:
                     await subscription_service.update_remnawave_user(
                         db,
@@ -3041,7 +3054,7 @@ async def try_resume_disabled_daily_after_topup(
         )
 
     # User notification
-    if bot and user.telegram_id:
+    if bot and user.telegram_id and settings.is_notifications_enabled():
         try:
             texts = get_texts(getattr(user, 'language', 'ru'))
 
@@ -3462,7 +3475,7 @@ async def _process_legacy_generic_cart(
             )
 
         # Send user notification only for Telegram users
-        if user.telegram_id:
+        if user.telegram_id and settings.is_notifications_enabled():
             try:
                 period_label = format_period_description(
                     selection.period.days,

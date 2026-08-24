@@ -44,15 +44,19 @@ def _fmt_date(value) -> str:
     return value.isoformat() if value else '—'
 
 
-async def _daily_breakdown(db: AsyncSession, remnawave_uuid: str, spec, window_start) -> list[str]:
-    """Посуточные наблюдения журнала по инбаундам измерения."""
-    if not remnawave_uuid or not spec.inbound_uuids:
+async def _daily_breakdown(db: AsyncSession, panel_id: int | None, spec, window_start) -> list[str]:
+    """Посуточные наблюдения журнала по инбаундам измерения.
+
+    Ключ журнала — числовой id панельного пользователя: панель 3.0.0 убрала
+    `uuid` из своей схемы, и единственный идентификатор записи теперь этот.
+    """
+    if not panel_id or not spec.inbound_uuids:
         return []
 
     result = await db.execute(
         select(TrafficDimensionSample.usage_date, TrafficDimensionSample.bytes)
         .where(
-            TrafficDimensionSample.remnawave_uuid == remnawave_uuid,
+            TrafficDimensionSample.remnawave_id == panel_id,
             TrafficDimensionSample.inbound_uuid.in_(sorted(spec.inbound_uuids)),
             TrafficDimensionSample.usage_date >= window_start,
         )
@@ -106,13 +110,13 @@ async def traffic_why(message: types.Message, db_user: User, db: AsyncSession):
     today = datetime.now(UTC).date()
     window_start = resolve_window_start(subscription, today=today)
     states = await get_dimension_states(db, subscription, specs=specs)
-    stripped = dimension_squad_policy.stripped_for(subscription.remnawave_uuid or '')
+    stripped = dimension_squad_policy.stripped_for(subscription.remnawave_id)
 
     lines = [
         '📐 <b>Разбор измерений трафика</b>',
         '',
         f'Пользователь: <code>{telegram_id}</code>',
-        f'Подписка: <code>#{subscription.id}</code>, панель: <code>{subscription.remnawave_uuid or "—"}</code>',
+        f'Подписка: <code>#{subscription.id}</code>, панель: <code>{subscription.remnawave_id or "—"}</code>',
         f'Расчётное окно с: <code>{window_start.isoformat()}</code> (сегодня {today.isoformat()})',
         f'Сквады подписки: <code>{", ".join(subscription.connected_squads or []) or "—"}</code>',
     ]
@@ -147,7 +151,7 @@ async def traffic_why(message: types.Message, db_user: User, db: AsyncSession):
 
         lines.append(f'  Инбаунды: <code>{", ".join(sorted(state.spec.inbound_uuids)) or "не заданы"}</code>')
 
-        breakdown = await _daily_breakdown(db, subscription.remnawave_uuid or '', state.spec, window_start)
+        breakdown = await _daily_breakdown(db, subscription.remnawave_id, state.spec, window_start)
         if breakdown:
             lines.append('  По суткам (UTC):')
             lines.extend(breakdown)

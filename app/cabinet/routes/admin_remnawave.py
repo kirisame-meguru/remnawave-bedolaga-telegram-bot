@@ -16,6 +16,7 @@ from app.database.crud.server_squad import (
 )
 from app.database.models import User
 from app.utils.cache import cache
+from app.utils.panel_node_usage import normalize_node_usage
 
 from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.remnawave import (
@@ -26,6 +27,12 @@ from ..schemas.remnawave import (
     Bandwidth,
     ConnectionStatus,
     DevicesStatsResponse,
+    # GeoCheck
+    GeocheckImage,
+    GeocheckJobResponse,
+    GeocheckRequest,
+    GeocheckResult,
+    GeocheckStartResponse,
     HealthResponse,
     # Inbounds
     InboundsListResponse,
@@ -74,7 +81,15 @@ try:
         RemnaWaveService,
     )
 except Exception:
-    RemnaWaveConfigurationError = None
+
+    class RemnaWaveConfigurationError(Exception):
+        """Заглушка на случай, когда сервис панели не импортировался.
+
+        Именно класс, а не None: иначе `except RemnaWaveConfigurationError`
+        ниже падал бы с TypeError вместо обработки ошибки. Реально сюда никто
+        не попадёт — при отсутствии сервиса `_get_service()` отдаёт 503 раньше.
+        """
+
     RemnaWaveService = None
 
 try:
@@ -154,6 +169,24 @@ def _serialize_node(node_data: dict[str, Any]) -> NodeInfo:
         versions=node_data.get('versions'),
         system=node_data.get('system'),
         active_plugin_uuid=node_data.get('active_plugin_uuid'),
+        ips=node_data.get('ips') or [],
+    )
+
+
+def _serialize_geocheck_result(result: dict[str, Any] | None) -> GeocheckResult | None:
+    """Приводит результат GeoCheck из camelCase панели к схеме кабинета."""
+    if not result:
+        return None
+
+    image_data = result.get('image') or None
+    image = GeocheckImage(**image_data) if isinstance(image_data, dict) else None
+
+    return GeocheckResult(
+        success=bool(result.get('success')),
+        node_uuid=result.get('nodeUuid'),
+        image=image,
+        raw_report=result.get('rawReport'),
+        message=result.get('message'),
     )
 
 
@@ -400,7 +433,10 @@ async def get_node_statistics(
     return NodeStatisticsResponse(
         node=_serialize_node(stats['node']),
         realtime=stats.get('realtime'),
-        usage_history=stats.get('usage_history') or [],
+        # Нормализуем той же функцией, что и Web API-близнец: схема здесь
+        # `list[dict[str, Any]]`, поэтому расхождение ключей pydantic не поймает,
+        # и фронт молча отрисовал бы пустые ячейки.
+        usage_history=normalize_node_usage(stats.get('usage_history'), node_uuid),
         last_updated=_parse_datetime(stats.get('last_updated')),
     )
 
@@ -426,7 +462,7 @@ async def get_node_usage(
         )
 
     usage = await service.get_node_user_usage_by_range(node_uuid, start_dt, end_dt)
-    return NodeUsageResponse(items=usage or [])
+    return NodeUsageResponse(items=normalize_node_usage(usage, node_uuid))
 
 
 @router.post('/nodes/{node_uuid}/action', response_model=NodeActionResponse)
@@ -494,6 +530,88 @@ async def restart_all_nodes(
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail='Failed to restart all nodes',
+    )
+
+
+# ============ GeoCheck (Remnawave 3.3.0) ============
+
+GEOCHECK_MIN_PANEL_VERSION = '3.3.0'
+
+
+def _geocheck_http_error(exc: Exception, *, missing_is_404: bool) -> HTTPException:
+    """Переводит ошибку панели в понятный админу ответ.
+
+    На панели старее 3.3.0 эндпоинта просто нет, и 404 при постановке задачи
+    означает не «нода не найдена», а «панель не умеет GeoCheck» — иначе админ
+    получит загадочное «не найдено» и пойдёт искать ноду.
+    """
+    status_code = getattr(exc, 'status_code', None)
+    message = getattr(exc, 'message', None) or str(exc)
+
+    if status_code == 404:
+        if missing_is_404:
+            return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=message)
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'GeoCheck requires Remnawave Panel and Node {GEOCHECK_MIN_PANEL_VERSION} or newer',
+        )
+
+    if status_code and 400 <= status_code < 500:
+        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
+
+    return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=message)
+
+
+@router.post('/nodes/{node_uuid}/geocheck', response_model=GeocheckStartResponse)
+async def start_node_geocheck(
+    node_uuid: str,
+    payload: GeocheckRequest,
+    admin: User = Depends(require_permission('remnawave:manage')),
+) -> GeocheckStartResponse:
+    """Queue a GeoCheck on the node and return its job id."""
+    service = _get_service()
+    _ensure_configured(service)
+
+    try:
+        job_id = await service.request_node_geocheck(node_uuid, ip=payload.ip, interface=payload.interface)
+    except RemnaWaveConfigurationError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning('GeoCheck запуск не удался', node_uuid=node_uuid, error=exc)
+        raise _geocheck_http_error(exc, missing_is_404=False) from exc
+
+    logger.info(
+        'Admin started GeoCheck',
+        telegram_id=admin.telegram_id,
+        node_uuid=node_uuid,
+        job_id=job_id,
+        route='ip' if payload.ip else 'interface' if payload.interface else 'default',
+    )
+    return GeocheckStartResponse(job_id=job_id)
+
+
+@router.get('/geocheck/{job_id}', response_model=GeocheckJobResponse)
+async def get_node_geocheck(
+    job_id: str,
+    admin: User = Depends(require_permission('remnawave:read')),
+) -> GeocheckJobResponse:
+    """Poll a GeoCheck job: the node may take up to a minute to answer."""
+    service = _get_service()
+    _ensure_configured(service)
+
+    try:
+        payload = await service.get_node_geocheck_result(job_id)
+    except RemnaWaveConfigurationError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning('GeoCheck опрос не удался', job_id=job_id, error=exc)
+        raise _geocheck_http_error(exc, missing_is_404=True) from exc
+
+    return GeocheckJobResponse(
+        job_id=job_id,
+        is_completed=bool(payload.get('isCompleted')),
+        is_failed=bool(payload.get('isFailed')),
+        result=_serialize_geocheck_result(payload.get('result')),
     )
 
 

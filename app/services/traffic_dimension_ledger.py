@@ -177,7 +177,7 @@ def applicable_specs(
 
 
 def sample_rows_from_matrix(
-    remnawave_uuid: str,
+    panel_user_id: int | None,
     matrix: InboundUsageMatrix,
     wanted_inbounds: frozenset[str],
     *,
@@ -189,11 +189,11 @@ def sample_rows_from_matrix(
     не пишется вовсе: она сворачивает всё окно в одни сутки, и апсерт
     ``GREATEST`` навсегда заморозил бы этот ком на случайном дне.
     """
-    if not remnawave_uuid or not matrix.has_daily_series or not wanted_inbounds:
+    if not panel_user_id or not matrix.has_daily_series or not wanted_inbounds:
         return []
     return [
         {
-            'remnawave_uuid': remnawave_uuid,
+            'remnawave_id': panel_user_id,
             'inbound_uuid': inbound_uuid,
             'usage_date': usage_date,
             'bytes': int(value),
@@ -216,7 +216,7 @@ async def store_samples(db: AsyncSession, rows: Sequence[Mapping[str, Any]]) -> 
 
     table = TrafficDimensionSample.__table__
     dialect = db.bind.dialect.name if db.bind is not None else ''
-    conflict_columns = ['remnawave_uuid', 'inbound_uuid', 'usage_date']
+    conflict_columns = ['remnawave_id', 'inbound_uuid', 'usage_date']
 
     if dialect == 'postgresql':
         from sqlalchemy.dialects.postgresql import insert as dialect_insert
@@ -248,7 +248,7 @@ async def _store_samples_portable(db: AsyncSession, rows: Sequence[Mapping[str, 
     for row in rows:
         existing = await db.execute(
             select(TrafficDimensionSample).where(
-                TrafficDimensionSample.remnawave_uuid == row['remnawave_uuid'],
+                TrafficDimensionSample.remnawave_id == row['remnawave_id'],
                 TrafficDimensionSample.inbound_uuid == row['inbound_uuid'],
                 TrafficDimensionSample.usage_date == row['usage_date'],
             )
@@ -281,13 +281,13 @@ class WindowUsage:
 
 async def window_usage(
     db: AsyncSession,
-    remnawave_uuid: str,
+    panel_user_id: int | None,
     *,
     window_start: date,
     window_end: date,
 ) -> WindowUsage:
     """Суммы по инбаундам за окно плюс первые сутки, которые журнал реально видел."""
-    if not remnawave_uuid:
+    if not panel_user_id:
         return WindowUsage(by_inbound={}, covered_from=None)
 
     result = await db.execute(
@@ -297,7 +297,7 @@ async def window_usage(
             func.min(TrafficDimensionSample.usage_date),
         )
         .where(
-            TrafficDimensionSample.remnawave_uuid == remnawave_uuid,
+            TrafficDimensionSample.remnawave_id == panel_user_id,
             TrafficDimensionSample.usage_date >= window_start,
             TrafficDimensionSample.usage_date <= window_end,
         )
@@ -421,8 +421,8 @@ class TrafficDimensionLedgerService:
         Ничего не коммитит: границы транзакции задаёт вызывающий.
         """
         stats = stats or LedgerCycleStats()
-        remnawave_uuid = getattr(subscription, 'remnawave_uuid', None)
-        if not remnawave_uuid:
+        panel_user_id = getattr(subscription, 'remnawave_id', None)
+        if not panel_user_id:
             return []
 
         wanted = applicable_specs(specs, reachable_inbounds(subscription.connected_squads, squad_index))
@@ -432,7 +432,7 @@ class TrafficDimensionLedgerService:
             return []
 
         window_start = resolve_window_start(subscription, today=today)
-        reading = await self.remnawave_service.read_inbound_usage(remnawave_uuid, window_start, today, api=api)
+        reading = await self.remnawave_service.read_inbound_usage(panel_user_id, window_start, today, api=api)
         stats.subscriptions_sampled += 1
         return await self._apply_reading(
             db, subscription, wanted, reading=reading, window_start=window_start, today=today, stats=stats
@@ -559,7 +559,7 @@ class TrafficDimensionLedgerService:
                 .options(selectinload(Subscription.tariff))
                 .where(
                     Subscription.status.in_(_SAMPLED_STATUSES),
-                    Subscription.remnawave_uuid.isnot(None),
+                    Subscription.remnawave_id.isnot(None),
                 )
                 .order_by(Subscription.id)
                 .offset(offset)
@@ -576,7 +576,7 @@ class TrafficDimensionLedgerService:
                 async with semaphore:
                     try:
                         return await self.remnawave_service.read_inbound_usage(
-                            subscription.remnawave_uuid, window_start, today, api=api
+                            subscription.remnawave_id, window_start, today, api=api
                         )
                     except Exception as e:
                         logger.warning(
@@ -636,19 +636,19 @@ class TrafficDimensionLedgerService:
         stats: LedgerCycleStats,
     ) -> list[DimensionMeasurement]:
         """Пишет наблюдения чтения в журнал и пересчитывает по нему состояния."""
-        remnawave_uuid = subscription.remnawave_uuid
+        panel_user_id = subscription.remnawave_id
 
         if reading.known:
             all_inbounds = frozenset().union(*(spec.inbound_uuids for spec in wanted))
             rows = sample_rows_from_matrix(
-                remnawave_uuid,
+                panel_user_id,
                 reading.matrix,
                 all_inbounds,
                 fetched_at=datetime.now(UTC),
             )
             stats.samples_written += await store_samples(db, rows)
 
-        usage = await window_usage(db, remnawave_uuid, window_start=window_start, window_end=today)
+        usage = await window_usage(db, panel_user_id, window_start=window_start, window_end=today)
 
         measurements: list[DimensionMeasurement] = []
         for spec in wanted:

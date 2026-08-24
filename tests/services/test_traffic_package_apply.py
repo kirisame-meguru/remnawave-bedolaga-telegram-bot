@@ -68,7 +68,7 @@ async def seed(db, *, traffic_limit_gb=100) -> Subscription:
         status='active',
         start_date=datetime(2026, 3, 1, tzinfo=UTC),
         end_date=datetime(2026, 4, 1, tzinfo=UTC),
-        remnawave_uuid='u-1',
+        remnawave_id=101,
         connected_squads=['sq-wl'],
         traffic_limit_gb=traffic_limit_gb,
         purchased_traffic_gb=0,

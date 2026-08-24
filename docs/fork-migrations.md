@@ -84,8 +84,19 @@ status, and on the runner reverting to singular `head`.
 Also worth a look before deploying:
 
 ```
-alembic heads    # expect upstream's tip AND xb0001
+alembic heads    # expect upstream's tip AND the newest xbNNNN
 ```
+
+### Upstream's `tests/database/test_migration_chain.py` is intentionally absent
+
+Upstream added that file in 4.x; it asserts a **single** alembic head and walks
+the graph from `get_current_head()` (singular). Both assumptions are the exact
+opposite of the rule above, so the file is deleted on every sync rather than
+kept red. Everything in it that still applies to a branched history —
+duplicate revision ids, `down_revision` pointing at nothing — is already
+covered branch-aware by `tests/test_alembic_revision_graph.py`. If a future
+sync re-adds it, delete it again; do not "fix" it by re-chaining the fork
+branch onto upstream's tip (see above for why that caused the outage).
 
 ## Adding a new fork migration
 

@@ -41,9 +41,9 @@ TABLES = [
 FETCHED_AT = datetime(2026, 3, 11, 12, 0, tzinfo=UTC)
 
 
-def sample(usage_date: date, inbound: str, value: int, uuid: str = 'u-1') -> dict:
+def sample(usage_date: date, inbound: str, value: int, panel_id: int = 101) -> dict:
     return {
-        'remnawave_uuid': uuid,
+        'remnawave_id': panel_id,
         'inbound_uuid': inbound,
         'usage_date': usage_date,
         'bytes': value,
@@ -60,7 +60,7 @@ async def test_upsert_keeps_the_larger_value(monkeypatch):
         await store_samples(db, [sample(date(2026, 3, 10), 'aaa', 1)])
         await db.commit()
 
-        usage = await window_usage(db, 'u-1', window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
+        usage = await window_usage(db, 101, window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
         assert usage.by_inbound == {'aaa': 900}
 
 
@@ -78,7 +78,7 @@ async def test_window_usage_respects_boundaries(monkeypatch):
         )
         await db.commit()
 
-        usage = await window_usage(db, 'u-1', window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
+        usage = await window_usage(db, 101, window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
         assert usage.by_inbound == {'aaa': 10, 'bbb': 20}
         assert usage.covered_from == date(2026, 3, 1)
         assert usage.bytes_for(['aaa', 'bbb']) == 30
@@ -87,11 +87,11 @@ async def test_window_usage_respects_boundaries(monkeypatch):
 @pytest.mark.asyncio
 async def test_window_usage_isolates_users(monkeypatch):
     async with memory_session(monkeypatch, TABLES) as db:
-        await store_samples(db, [sample(date(2026, 3, 5), 'aaa', 10, uuid='u-1')])
-        await store_samples(db, [sample(date(2026, 3, 5), 'aaa', 9999, uuid='u-2')])
+        await store_samples(db, [sample(date(2026, 3, 5), 'aaa', 10, panel_id=101)])
+        await store_samples(db, [sample(date(2026, 3, 5), 'aaa', 9999, panel_id=202)])
         await db.commit()
 
-        usage = await window_usage(db, 'u-1', window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
+        usage = await window_usage(db, 101, window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
         assert usage.by_inbound == {'aaa': 10}
 
 
@@ -99,7 +99,7 @@ async def test_window_usage_isolates_users(monkeypatch):
 async def test_window_usage_without_samples_is_uncovered(monkeypatch):
     """Пустой журнал — это дыра в покрытии, а не подтверждённый ноль."""
     async with memory_session(monkeypatch, TABLES) as db:
-        usage = await window_usage(db, 'u-1', window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
+        usage = await window_usage(db, 101, window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
         assert usage.by_inbound == {}
         assert usage.covered_from is None
 
@@ -120,7 +120,7 @@ async def test_prune_drops_only_old_samples(monkeypatch):
         await db.commit()
         assert removed == 1
 
-        usage = await window_usage(db, 'u-1', window_start=date(2020, 1, 1), window_end=date(2026, 3, 11))
+        usage = await window_usage(db, 101, window_start=date(2020, 1, 1), window_end=date(2026, 3, 11))
         assert usage.by_inbound == {'aaa': 2}
 
 
@@ -144,7 +144,7 @@ async def make_subscription(db) -> Subscription:
         status='active',
         start_date=datetime(2026, 3, 1, tzinfo=UTC),
         end_date=datetime(2026, 4, 1, tzinfo=UTC),
-        remnawave_uuid='u-1',
+        remnawave_id=101,
         connected_squads=['sq-1'],
     )
     db.add(subscription)
@@ -194,8 +194,8 @@ async def test_state_is_written_from_the_ledger(monkeypatch):
         await make_dimension(db, spec)
         subscription = await make_subscription(db)
 
-        await store_samples(db, [sample(date(2026, 3, 2), 'aaa', 3 * GB, uuid='u-1')])
-        usage = await window_usage(db, 'u-1', window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
+        await store_samples(db, [sample(date(2026, 3, 2), 'aaa', 3 * GB, panel_id=101)])
+        usage = await window_usage(db, 101, window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
 
         service = TrafficDimensionLedgerService()
         measurement = await service._write_state(
@@ -232,8 +232,8 @@ async def test_failed_reading_keeps_previous_value(monkeypatch):
         subscription = await make_subscription(db)
         service = TrafficDimensionLedgerService()
 
-        await store_samples(db, [sample(date(2026, 3, 1), 'aaa', 7 * GB, uuid='u-1')])
-        usage = await window_usage(db, 'u-1', window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
+        await store_samples(db, [sample(date(2026, 3, 1), 'aaa', 7 * GB, panel_id=101)])
+        usage = await window_usage(db, 101, window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
         await service._write_state(
             db,
             subscription,
@@ -250,7 +250,7 @@ async def test_failed_reading_keeps_previous_value(monkeypatch):
             db,
             subscription,
             spec,
-            usage=await window_usage(db, 'u-1', window_start=date(2026, 3, 1), window_end=date(2026, 3, 11)),
+            usage=await window_usage(db, 101, window_start=date(2026, 3, 1), window_end=date(2026, 3, 11)),
             reading_known=False,
             has_daily_series=True,
             live_bytes=0,
@@ -273,12 +273,12 @@ async def test_window_rollover_resets_the_counter(monkeypatch):
         subscription = await make_subscription(db)
         service = TrafficDimensionLedgerService()
 
-        await store_samples(db, [sample(date(2026, 3, 1), 'aaa', 9 * GB, uuid='u-1')])
+        await store_samples(db, [sample(date(2026, 3, 1), 'aaa', 9 * GB, panel_id=101)])
         await service._write_state(
             db,
             subscription,
             spec,
-            usage=await window_usage(db, 'u-1', window_start=date(2026, 3, 1), window_end=date(2026, 3, 31)),
+            usage=await window_usage(db, 101, window_start=date(2026, 3, 1), window_end=date(2026, 3, 31)),
             reading_known=True,
             has_daily_series=True,
             live_bytes=9 * GB,
@@ -290,7 +290,7 @@ async def test_window_rollover_resets_the_counter(monkeypatch):
             db,
             subscription,
             spec,
-            usage=await window_usage(db, 'u-1', window_start=date(2026, 4, 1), window_end=date(2026, 4, 2)),
+            usage=await window_usage(db, 101, window_start=date(2026, 4, 1), window_end=date(2026, 4, 2)),
             reading_known=True,
             has_daily_series=True,
             live_bytes=0,
@@ -310,7 +310,7 @@ async def test_legacy_panel_counter_never_goes_backwards(monkeypatch):
         await make_dimension(db, spec)
         subscription = await make_subscription(db)
         service = TrafficDimensionLedgerService()
-        empty = await window_usage(db, 'u-1', window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
+        empty = await window_usage(db, 101, window_start=date(2026, 3, 1), window_end=date(2026, 3, 11))
 
         await service._write_state(
             db,
@@ -387,8 +387,8 @@ async def test_refresh_subscription_end_to_end(monkeypatch):
 
         service = TrafficDimensionLedgerService()
 
-        async def fake_read(remnawave_uuid, start, end, *, api=None):
-            assert remnawave_uuid == 'u-1'
+        async def fake_read(panel_user_id, start, end, *, api=None):
+            assert panel_user_id == 101, 'панель адресуется числовым id подписки'
             assert start == date(2026, 3, 1), 'окно открывается вместе с подпиской'
             return FakePanelReading(matrix)
 

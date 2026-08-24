@@ -28,6 +28,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from math import ceil
+from typing import Any
 
 import structlog
 
@@ -204,8 +205,36 @@ def effective_panel_traffic_limit_bytes(base_limit_gb: int, states: Iterable) ->
 # ============================== Реестр блокировок ==============================
 
 
+def panel_key(value: Any) -> int | None:
+    """Числовой id панели из того, что реально доезжает до границы API.
+
+    Панель 3.0.0 идентифицирует пользователя только числовым ``id``, но сюда он
+    приходит и строкой: BigInteger из БД, JSON кабинета, состояние FSM. Всё,
+    что на id не похоже (``None``, пустая строка, мусор), означает «панельной
+    идентичности нет» — такой пользователь просто ничем не ограничен.
+
+    Исключение бросать нельзя: карта читается на каждом исходящем обновлении
+    панели, и падение здесь уронило бы любую запись, а не только блокировку.
+    Поэтому проверка своя, а не ``coerce_panel_user_id`` из клиента панели:
+    тот кидает, и импорт клиента сюда замкнул бы цикл (клиент читает эту карту).
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    text = str(value).strip()
+    # Строго ASCII-цифры: '²' и '٥' проходят isdigit(), но id не образуют.
+    if not text.isascii() or not text.isdigit():
+        return None
+    number = int(text)
+    return number if number > 0 else None
+
+
 class DimensionSquadPolicy:
     """Какие сквады сняты у каких панельных пользователей прямо сейчас.
+
+    Ключ — числовой ``id`` пользователя в панели (``subscriptions.remnawave_id``):
+    в 3.0.0 у записи пользователя другого идентификатора нет.
 
     Живёт в памяти процесса и читается на каждом исходящем обновлении панели,
     поэтому здесь не должно быть ни запросов к БД, ни блокировок: реконсилятор
@@ -216,48 +245,59 @@ class DimensionSquadPolicy:
     """
 
     def __init__(self) -> None:
-        self._stripped: dict[str, frozenset[str]] = {}
+        self._stripped: dict[int, frozenset[str]] = {}
 
-    def replace_all(self, mapping: Mapping[str, Iterable[str]]) -> None:
+    def replace_all(self, mapping: Mapping[Any, Iterable[str]]) -> None:
         """Заменяет карту целиком — так реконсилятор публикует итог цикла."""
-        self._stripped = {
-            str(uuid): frozenset(str(squad).lower() for squad in squads)
-            for uuid, squads in mapping.items()
-            if uuid and squads
-        }
+        stripped: dict[int, frozenset[str]] = {}
+        for raw_id, squads in mapping.items():
+            panel_id = panel_key(raw_id)
+            if panel_id is None or not squads:
+                continue
+            stripped[panel_id] = frozenset(str(squad).lower() for squad in squads)
+        self._stripped = stripped
 
-    def set_for(self, remnawave_uuid: str, squads: Iterable[str]) -> None:
+    def set_for(self, panel_user_id: Any, squads: Iterable[str]) -> None:
+        panel_id = panel_key(panel_user_id)
+        if panel_id is None:
+            return
         squad_set = frozenset(str(squad).lower() for squad in squads or [])
         if squad_set:
-            self._stripped[str(remnawave_uuid)] = squad_set
+            self._stripped[panel_id] = squad_set
         else:
-            self._stripped.pop(str(remnawave_uuid), None)
+            self._stripped.pop(panel_id, None)
 
-    def clear_for(self, remnawave_uuid: str) -> None:
-        self._stripped.pop(str(remnawave_uuid), None)
+    def clear_for(self, panel_user_id: Any) -> None:
+        panel_id = panel_key(panel_user_id)
+        if panel_id is not None:
+            self._stripped.pop(panel_id, None)
 
-    def stripped_for(self, remnawave_uuid: str) -> frozenset[str]:
-        return self._stripped.get(str(remnawave_uuid), frozenset())
+    def stripped_for(self, panel_user_id: Any) -> frozenset[str]:
+        panel_id = panel_key(panel_user_id)
+        if panel_id is None:
+            return frozenset()
+        return self._stripped.get(panel_id, frozenset())
 
-    def blocked_uuids(self) -> frozenset[str]:
+    def blocked_panel_ids(self) -> frozenset[int]:
         return frozenset(self._stripped)
 
-    def filter_squads(self, remnawave_uuid: str, squads: Sequence[str] | None) -> list[str] | None:
+    def filter_squads(self, panel_user_id: Any, squads: Sequence[str] | None) -> list[str] | None:
         """Убирает снятые сквады из исходящего обновления панели.
 
         Возвращает исходный список без изменений, если по пользователю ничего
-        не снято, — вызывающему не нужно знать про измерения вообще.
+        не снято, — вызывающему не нужно знать про измерения вообще. Подписка
+        без панельного id тоже ничего не теряет: ограничивать нечего.
         """
         if squads is None:
             return None
-        stripped = self.stripped_for(remnawave_uuid)
+        stripped = self.stripped_for(panel_user_id)
         if not stripped:
             return list(squads)
         filtered = panel_squads_for(squads, stripped)
         if len(filtered) != len(squads):
             logger.debug(
                 'Сняты сквады измерения из обновления панели',
-                remnawave_uuid=remnawave_uuid,
+                panel_user_id=panel_user_id,
                 stripped=sorted(stripped),
             )
         return filtered

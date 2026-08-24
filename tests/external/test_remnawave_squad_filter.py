@@ -15,6 +15,10 @@ from app.external.remnawave_api import RemnaWaveAPI
 from app.services.traffic_dimension_enforcement import dimension_squad_policy
 
 
+PANEL_ID = 101
+OTHER_PANEL_ID = 202
+
+
 @pytest.fixture(autouse=True)
 def clean_policy():
     dimension_squad_policy.replace_all({})
@@ -31,10 +35,10 @@ class RecordingAPI(RemnaWaveAPI):
 
     async def _make_request(self, method, endpoint, data=None, params=None):
         self.payloads.append(dict(data or {}))
-        return {'response': {'uuid': 'u-1', 'username': 'x', 'activeInternalSquads': []}}
+        return {'response': {'id': PANEL_ID, 'username': 'x', 'activeInternalSquads': []}}
 
     def _parse_user(self, data):
-        return SimpleNamespace(uuid=data.get('uuid'), hwid_device_limit=None)
+        return SimpleNamespace(id=data.get('id'), hwid_device_limit=None)
 
     async def enrich_user_with_happ_link(self, user):
         return user
@@ -43,9 +47,9 @@ class RecordingAPI(RemnaWaveAPI):
 @pytest.mark.asyncio
 async def test_blocked_squads_are_stripped_from_any_update():
     api = RecordingAPI()
-    dimension_squad_policy.set_for('u-1', ['sq-wl'])
+    dimension_squad_policy.set_for(PANEL_ID, ['sq-wl'])
 
-    await api.update_user(uuid='u-1', active_internal_squads=['sq-wl', 'sq-eu'])
+    await api.update_user(user_id=PANEL_ID, active_internal_squads=['sq-wl', 'sq-eu'])
 
     assert api.payloads[0]['activeInternalSquads'] == ['sq-eu']
 
@@ -53,9 +57,9 @@ async def test_blocked_squads_are_stripped_from_any_update():
 @pytest.mark.asyncio
 async def test_unblocked_users_pass_through_untouched():
     api = RecordingAPI()
-    dimension_squad_policy.set_for('u-other', ['sq-wl'])
+    dimension_squad_policy.set_for(OTHER_PANEL_ID, ['sq-wl'])
 
-    await api.update_user(uuid='u-1', active_internal_squads=['sq-wl', 'sq-eu'])
+    await api.update_user(user_id=PANEL_ID, active_internal_squads=['sq-wl', 'sq-eu'])
 
     assert api.payloads[0]['activeInternalSquads'] == ['sq-wl', 'sq-eu']
 
@@ -64,9 +68,9 @@ async def test_unblocked_users_pass_through_untouched():
 async def test_updates_that_do_not_touch_squads_stay_untouched():
     """`active_internal_squads=None` означает «сквады не трогай»."""
     api = RecordingAPI()
-    dimension_squad_policy.set_for('u-1', ['sq-wl'])
+    dimension_squad_policy.set_for(PANEL_ID, ['sq-wl'])
 
-    await api.update_user(uuid='u-1', description='ping')
+    await api.update_user(user_id=PANEL_ID, description='ping')
 
     assert 'activeInternalSquads' not in api.payloads[0]
 
@@ -75,21 +79,21 @@ async def test_updates_that_do_not_touch_squads_stay_untouched():
 async def test_restoring_all_squads_is_blocked_until_the_policy_is_cleared():
     """Ровно тот сценарий, ради которого фильтр и стоит на границе."""
     api = RecordingAPI()
-    dimension_squad_policy.set_for('u-1', ['sq-wl'])
+    dimension_squad_policy.set_for(PANEL_ID, ['sq-wl'])
 
-    await api.update_user(uuid='u-1', active_internal_squads=['sq-wl', 'sq-eu'])
+    await api.update_user(user_id=PANEL_ID, active_internal_squads=['sq-wl', 'sq-eu'])
     assert api.payloads[-1]['activeInternalSquads'] == ['sq-eu']
 
-    dimension_squad_policy.clear_for('u-1')
-    await api.update_user(uuid='u-1', active_internal_squads=['sq-wl', 'sq-eu'])
+    dimension_squad_policy.clear_for(PANEL_ID)
+    await api.update_user(user_id=PANEL_ID, active_internal_squads=['sq-wl', 'sq-eu'])
     assert api.payloads[-1]['activeInternalSquads'] == ['sq-wl', 'sq-eu']
 
 
 @pytest.mark.asyncio
 async def test_filter_is_case_insensitive():
     api = RecordingAPI()
-    dimension_squad_policy.set_for('u-1', ['SQ-WL'])
+    dimension_squad_policy.set_for(PANEL_ID, ['SQ-WL'])
 
-    await api.update_user(uuid='u-1', active_internal_squads=['sq-wl', 'sq-eu'])
+    await api.update_user(user_id=PANEL_ID, active_internal_squads=['sq-wl', 'sq-eu'])
 
     assert api.payloads[0]['activeInternalSquads'] == ['sq-eu']

@@ -152,46 +152,60 @@ def test_merge_deduplicates():
 
 def test_policy_filters_only_known_users():
     policy = DimensionSquadPolicy()
-    policy.set_for('u-1', ['sq-block'])
+    policy.set_for(101, ['sq-block'])
 
-    assert policy.filter_squads('u-1', ['sq-block', 'sq-keep']) == ['sq-keep']
-    assert policy.filter_squads('u-2', ['sq-block', 'sq-keep']) == ['sq-block', 'sq-keep']
+    assert policy.filter_squads(101, ['sq-block', 'sq-keep']) == ['sq-keep']
+    assert policy.filter_squads(202, ['sq-block', 'sq-keep']) == ['sq-block', 'sq-keep']
 
 
 def test_policy_passes_none_through():
     """`active_internal_squads=None` означает «не трогай сквады»."""
     policy = DimensionSquadPolicy()
-    policy.set_for('u-1', ['sq-block'])
-    assert policy.filter_squads('u-1', None) is None
+    policy.set_for(101, ['sq-block'])
+    assert policy.filter_squads(101, None) is None
+
+
+def test_policy_without_a_panel_id_strips_nothing():
+    """`remnawave_id IS NULL` — обычное состояние строки до привязки к панели.
+
+    Такое обновление в панель всё равно уходит (по `users.remnawave_id`), и
+    карта блокировок обязана пропустить его как есть, а не упасть на попытке
+    привести `None` к ключу.
+    """
+    policy = DimensionSquadPolicy()
+    policy.set_for(101, ['sq-a'])
+
+    assert policy.filter_squads(None, ['sq-a']) == ['sq-a']
+    assert policy.stripped_for(None) == frozenset()
 
 
 def test_policy_clear_restores_access():
     policy = DimensionSquadPolicy()
-    policy.set_for('u-1', ['sq-block'])
-    policy.clear_for('u-1')
-    assert policy.filter_squads('u-1', ['sq-block']) == ['sq-block']
+    policy.set_for(101, ['sq-block'])
+    policy.clear_for(101)
+    assert policy.filter_squads(101, ['sq-block']) == ['sq-block']
 
 
 def test_policy_set_with_empty_squads_clears():
     policy = DimensionSquadPolicy()
-    policy.set_for('u-1', ['sq-block'])
-    policy.set_for('u-1', [])
-    assert policy.blocked_uuids() == frozenset()
+    policy.set_for(101, ['sq-block'])
+    policy.set_for(101, [])
+    assert policy.blocked_panel_ids() == frozenset()
 
 
 def test_policy_replace_all_drops_previous_entries():
     policy = DimensionSquadPolicy()
-    policy.set_for('u-1', ['sq-a'])
-    policy.replace_all({'u-2': ['sq-b']})
+    policy.set_for(101, ['sq-a'])
+    policy.replace_all({202: ['sq-b']})
 
-    assert policy.blocked_uuids() == frozenset({'u-2'})
-    assert policy.filter_squads('u-1', ['sq-a']) == ['sq-a']
+    assert policy.blocked_panel_ids() == frozenset({202})
+    assert policy.filter_squads(101, ['sq-a']) == ['sq-a']
 
 
 def test_policy_is_case_insensitive_about_squads():
     policy = DimensionSquadPolicy()
-    policy.set_for('u-1', ['SQ-BLOCK'])
-    assert policy.filter_squads('u-1', ['sq-block']) == []
+    policy.set_for(101, ['SQ-BLOCK'])
+    assert policy.filter_squads(101, ['sq-block']) == []
 
 
 # ------------------------------ таблица решений ------------------------------

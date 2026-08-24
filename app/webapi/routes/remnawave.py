@@ -10,6 +10,7 @@ from app.database.crud.server_squad import (
     count_active_users_for_squad,
     get_server_squad_by_uuid,
 )
+from app.utils.panel_node_usage import normalize_node_usage
 
 from ..dependencies import get_db_session, require_api_token
 from ..schemas.remnawave import (
@@ -21,6 +22,7 @@ from ..schemas.remnawave import (
     RemnaWaveNodeActionResponse,
     RemnaWaveNodeListResponse,
     RemnaWaveNodeStatisticsResponse,
+    RemnaWaveNodeUsageItem,
     RemnaWaveNodeUsageResponse,
     RemnaWaveOperationResponse,
     RemnaWaveSquad,
@@ -45,7 +47,10 @@ try:  # pragma: no cover - импорт может не работать без 
         RemnaWaveService,
     )
 except Exception:  # pragma: no cover - при ошибке импорта скрываем функционал
-    RemnaWaveConfigurationError = None  # type: ignore[assignment]
+
+    class RemnaWaveConfigurationError(Exception):
+        """Заглушка: `except` требует класс, с None он падал бы с TypeError."""
+
     RemnaWaveService = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:  # pragma: no cover - только для типов в IDE
@@ -108,6 +113,16 @@ def _serialize_node(node_data: dict[str, Any]) -> RemnaWaveNode:
         system=node_data.get('system'),
         active_plugin_uuid=node_data.get('active_plugin_uuid'),
     )
+
+
+def _serialize_node_usage(raw_items: Any, node_uuid: str) -> list[RemnaWaveNodeUsageItem]:
+    """Типизированная обёртка над общей нормализацией.
+
+    Сама форма живёт в ``app/utils/panel_node_usage`` — её делит кабинетный
+    хендлер-близнец (``app/cabinet/routes/admin_remnawave.py``), чтобы две
+    админские поверхности не разъезжались по ключам.
+    """
+    return [RemnaWaveNodeUsageItem(**item) for item in normalize_node_usage(raw_items, node_uuid)]
 
 
 def _parse_last_updated(value: Any) -> datetime | None:
@@ -206,7 +221,7 @@ async def get_node_statistics(
         raise HTTPException(status.HTTP_404_NOT_FOUND, 'Не удалось получить информацию по ноде')
 
     node_data = _serialize_node(stats['node'])
-    usage_history = stats.get('usage_history') or []
+    usage_history = _serialize_node_usage(stats.get('usage_history'), node_uuid)
     realtime = stats.get('realtime')
     last_updated = _parse_last_updated(stats.get('last_updated'))
 
@@ -235,7 +250,7 @@ async def get_node_usage_range(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Некорректный диапазон дат')
 
     usage = await service.get_node_user_usage_by_range(node_uuid, start_dt, end_dt)
-    return RemnaWaveNodeUsageResponse(items=usage or [])
+    return RemnaWaveNodeUsageResponse(items=_serialize_node_usage(usage, node_uuid))
 
 
 @router.post('/nodes/{node_uuid}/actions', response_model=RemnaWaveNodeActionResponse)
@@ -441,10 +456,8 @@ async def sync_from_panel(
         stats = await service.sync_users_from_panel(db, payload.mode)
         detail = 'Синхронизация из панели выполнена'
         return RemnaWaveGenericSyncResponse(success=True, detail=detail, data=stats)
-    except Exception as exc:  # pragma: no cover - точный тип зависит от импорта
-        if RemnaWaveConfigurationError and isinstance(exc, RemnaWaveConfigurationError):
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
-        raise
+    except RemnaWaveConfigurationError as exc:  # pragma: no cover - зависит от окружения
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
 
 @router.post('/sync/to-panel', response_model=RemnaWaveGenericSyncResponse)
