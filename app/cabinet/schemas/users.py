@@ -36,6 +36,15 @@ class SortByEnum(StrEnum):
     TOTAL_SPENT = 'total_spent'
     PURCHASE_COUNT = 'purchase_count'
     SUBSCRIPTION_END_DATE = 'subscription_end_date'
+    #: Конец временного доступа (грейса) — та дата, что в строке «временно до …».
+    GRACE_UNTIL = 'grace_until'
+
+
+class SortOrderEnum(StrEnum):
+    """Direction of the users list sort; omitted — the field's usual direction."""
+
+    ASC = 'asc'
+    DESC = 'desc'
 
 
 # === User Subscription Info ===
@@ -68,6 +77,8 @@ class UserSubscriptionInfo(BaseModel):
     autopay_enabled: bool = False
     is_active: bool = False
     days_remaining: int = 0
+    # Открыт временный доступ (грейс) до этого числа; None — обычная подписка.
+    grace_until: datetime | None = None
     purchased_traffic_gb: int = 0
     traffic_purchases: list[TrafficPurchaseItem] = []
 
@@ -101,6 +112,8 @@ class SubscriptionListItem(BaseModel):
     traffic_used_gb: float = 0
     traffic_limit_gb: int = 0
     device_limit: int = 0
+    # Открыт временный доступ (грейс) до этого числа; None — обычная подписка.
+    grace_until: datetime | None = None
 
 
 class UserListItem(BaseModel):
@@ -117,6 +130,11 @@ class UserListItem(BaseModel):
     balance_rubles: float
     created_at: datetime
     last_activity: datetime | None = None
+    # Подключён к VPN прямо сейчас (по панели); None — панель не ответила, неизвестно.
+    is_online: bool | None = None
+    # Отметка последнего подключения из панели — по ней кабинет сам гасит зелёную точку,
+    # не дожидаясь следующего ответа сервера. None — сейчас не подключён либо панель молчит.
+    online_at: datetime | None = None
 
     # Subscription summary
     has_subscription: bool = False
@@ -129,6 +147,8 @@ class UserListItem(BaseModel):
     traffic_limit_gb: int = 0
     device_limit: int = 0
     days_remaining: int = 0
+    # Временный доступ (грейс) у показанной подписки — до какого числа он открыт.
+    grace_until: datetime | None = None
 
     # All subscriptions (multi-tariff)
     subscriptions: list[SubscriptionListItem] = []
@@ -282,6 +302,10 @@ class UserDetailResponse(BaseModel):
 
     # Remnawave panel user id
     remnawave_id: int | None = None
+
+    # Режим продаж бота: плитки карточки в классике, тарифах и мультитарифе разные.
+    sales_mode: str = 'tariffs'
+    multi_tariff_enabled: bool = False
 
 
 # === Panel Info ===
@@ -768,6 +792,12 @@ class PanelSyncStatusResponse(BaseModel):
     panel_device_limit: int = 0
     panel_squads: list[str] = []
 
+    # Открытый временный доступ (грейс): пока он идёт, панель намеренно держит
+    # его настройки — дату, статус, лимит и сквад. Бот их не перенимает, поэтому
+    # расхождением это не считается.
+    grace_open: bool = False
+    grace_until: datetime | None = None
+
     # Differences
     has_differences: bool = False
     differences: list[str] = []
@@ -806,6 +836,9 @@ class ResetTrialResponse(BaseModel):
     message: str
     subscription_deleted: bool = False
     has_used_trial_reset: bool = False
+    # Главный ответ на вопрос админа: сможет ли человек взять триал после нажатия.
+    # Без него кнопка сообщала «успешно» даже когда ничего не менялось.
+    trial_available: bool = False
 
 
 class ResetSubscriptionRequest(BaseModel):

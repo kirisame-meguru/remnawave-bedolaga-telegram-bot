@@ -185,10 +185,14 @@ def test_invalid_user_id_error_is_a_remnawave_api_error():
 @pytest.mark.parametrize(
     ('error', 'expected'),
     [
-        (RemnaWaveAPIError('not found', 404, {}), True),
-        (RemnaWaveAPIError('user not found', 500, {'errorCode': 'A018'}), True),
+        (RemnaWaveAPIError('User not found', 404, {}), True),
+        (RemnaWaveAPIError('User not found', 404, {'errorCode': 'A025'}), True),
         (RemnaWaveAPIError('user not found', 500, {'errorCode': 'A063'}), True),
         (RemnaWaveAPIError('user not found', 404, {'errorCode': 'A063'}), True),
+        # 3.4.3: A018 = «Failed to create user» (500), не «юзера нет»; голый 404 без
+        # сообщения панели (прокси/чужая ручка) — тоже не признак отсутствия.
+        (RemnaWaveAPIError('Failed to create user', 500, {'errorCode': 'A018'}), False),
+        (RemnaWaveAPIError('not found', 404, {}), False),
         # 400 = панель отвергла сам запрос (например, id не коерсится в число).
         (RemnaWaveAPIError('Validation failed', 400, {}), False),
         (RemnaWaveAPIError('Validation failed', 400, {'errorCode': 'A001'}), False),
@@ -344,8 +348,8 @@ async def test_resolve_user_rejects_zero_or_multiple_identifiers(kwargs: dict[st
 @pytest.mark.parametrize(
     'error',
     [
-        RemnaWaveAPIError('not found', 404, {}),
-        RemnaWaveAPIError('user not found', 500, {'errorCode': 'A018'}),
+        RemnaWaveAPIError('User not found', 404, {}),
+        RemnaWaveAPIError('User not found', 404, {'errorCode': 'A025'}),
         RemnaWaveAPIError('user not found', 500, {'errorCode': 'A063'}),
     ],
 )
@@ -1085,3 +1089,25 @@ async def test_delete_all_devices_reports_success_when_panel_is_empty(monkeypatc
 
     monkeypatch.setattr(api, '_make_request', fake)
     assert await api.reset_user_devices(42) is True
+
+
+async def test_update_user_sends_null_tag_to_clear_it():
+    """В контракте панели ``tag`` в PATCH — optional + nullable: не прислать = не
+    трогать, прислать ``null`` = снять. Без null триальный тег переживал бы покупку."""
+    api = _api()
+    api._make_request = AsyncMock(return_value={'response': _user_payload()})
+
+    await api.update_user(42, tag=None)
+
+    body = api._make_request.call_args.args[2]
+    assert 'tag' in body
+    assert body['tag'] is None
+
+
+async def test_update_user_leaves_tag_alone_when_not_given():
+    api = _api()
+    api._make_request = AsyncMock(return_value={'response': _user_payload()})
+
+    await api.update_user(42, telegram_id=555)
+
+    assert 'tag' not in api._make_request.call_args.args[2]

@@ -127,7 +127,9 @@ def _prepare_logo_for_send(path: Path) -> Path:
 
 # Telegram API: caption limit is 1024 characters AFTER HTML entity parsing (tags stripped)
 TELEGRAM_CAPTION_LIMIT = 1024
-_HTML_TAG_RE = re.compile(r'<[^>]+>')
+# [^<>] держит вырезание тегов линейным: [^>] на строке из одних '<'
+# перебирает хвост заново с каждой позиции.
+_HTML_TAG_RE = re.compile(r'<[^<>]+>')
 
 
 def caption_exceeds_telegram_limit(text: str | None) -> bool:
@@ -286,7 +288,7 @@ async def _answer_with_photo(self: Message, text: str = None, **kwargs):
         pass
     language = _get_language(self)
 
-    if LOGO_PATH.exists():
+    if LOGO_PATH.exists():  # noqa: ASYNC240 — stat локального файла, один системный вызов
         try:
             result = await self.answer_photo(get_logo_media(), caption=text, **kwargs)
             _cache_logo_file_id(result)
@@ -365,7 +367,7 @@ async def _edit_with_photo(self: Message, text: str, **kwargs):
                 return await _text_answer(self, text, **kwargs)
         except Exception:
             pass
-        if LOGO_PATH.exists():
+        if LOGO_PATH.exists():  # noqa: ASYNC240 — stat локального файла, один системный вызов
             media = get_logo_media()
         else:
             media = self.photo[-1].file_id

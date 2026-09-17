@@ -17,6 +17,7 @@ from app.database.crud.subscription import (
     extend_subscription,
     get_subscription_by_id,
     reactivate_subscription,
+    reconcile_tariff_traffic_limit,
 )
 from app.database.crud.tariff import get_tariff_by_id
 from app.database.crud.user import add_user_balance, get_user_by_id
@@ -33,6 +34,7 @@ from app.database.models import (
     User,
     UserPromoGroup,
 )
+from app.utils.subscription_time import local_days_until
 
 from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.bulk_actions import (
@@ -244,10 +246,16 @@ async def _do_activate_subscription(
             username=user.username,
         )
 
+    # Оверлей грейса, осевший в подписке (v4.10–4.11), — не её срок: вернуть до расчёта.
+    from app.services.grace_access_echo import undo_grace_overlay_echo
+
+    await undo_grace_overlay_echo(db, sub)
     sub.status = SubscriptionStatus.ACTIVE.value
     if sub.end_date and sub.end_date <= datetime.now(UTC):
         # Extend by 30 days if expired
         sub.end_date = datetime.now(UTC) + timedelta(days=30)
+    # Условия тарифа на новый срок: база тарифа + активные докупки.
+    await reconcile_tariff_traffic_limit(db, sub)
     await db.commit()
     await db.refresh(sub)
     await _sync_subscription_to_panel(db, user, sub)
@@ -775,8 +783,7 @@ def _build_subscription_info(subs: list[Subscription]) -> list[BulkSubscriptionI
     for sub in subs:
         days_remaining = 0
         if sub.end_date:
-            delta = sub.end_date - datetime.now(UTC)
-            days_remaining = max(0, delta.days)
+            days_remaining = local_days_until(sub.end_date)
 
         tariff_name = None
         if sub.tariff:

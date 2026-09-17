@@ -17,6 +17,7 @@ from app.keyboards.inline import (
     get_admin_tickets_keyboard,
 )
 from app.localization.texts import get_texts
+from app.services.notification_delivery_service import notification_delivery_service
 from app.services.support_settings_service import SupportSettingsService
 from app.states import AdminTicketStates
 from app.utils.cache import RateLimitCache
@@ -27,6 +28,7 @@ from app.utils.ticket_text import (
     build_ticket_pages,
     preview_text,
 )
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -198,13 +200,13 @@ async def view_admin_ticket(
         header += '📱 Username: отсутствует\n'
     header += f'📝 Заголовок: {html.escape(ticket.title)}\n'
     header += f'📊 Статус: {ticket.status_emoji} {status_text}\n'
-    header += f'📅 Создан: {ticket.created_at.strftime("%d.%m.%Y %H:%M")}\n\n'
+    header += f'📅 Создан: {format_local_datetime(ticket.created_at, "%d.%m.%Y %H:%M")}\n\n'
 
     if ticket.is_user_reply_blocked:
         if ticket.user_reply_block_permanent:
             header += '🚫 Пользователь заблокирован навсегда\n\n'
         elif ticket.user_reply_block_until:
-            header += f'⏳ Блок до: {ticket.user_reply_block_until.strftime("%d.%m.%Y %H:%M")}\n\n'
+            header += f'⏳ Блок до: {format_local_datetime(ticket.user_reply_block_until, "%d.%m.%Y %H:%M")}\n\n'
 
     # Формируем блоки сообщений
     message_blocks: list[str] = []
@@ -212,7 +214,7 @@ async def view_admin_ticket(
         message_blocks.append(f'💬 Сообщения ({len(ticket.messages)}):\n\n')
         for msg in ticket.messages:
             sender = '👤 Пользователь' if msg.is_user_message else '🛠️ Поддержка'
-            block = f'{sender} ({msg.created_at.strftime("%d.%m %H:%M")}):\n{html.escape(msg.message_text or "")}\n\n'
+            block = f'{sender} ({format_local_datetime(msg.created_at, "%d.%m %H:%M")}):\n{html.escape(msg.message_text or "")}\n\n'
             if getattr(msg, 'has_media', False) and getattr(msg, 'media_type', None) == 'photo':
                 block += '📎 Вложение: фото\n\n'
             message_blocks.append(block)
@@ -281,10 +283,8 @@ async def view_admin_ticket(
             nav_row.append(
                 types.InlineKeyboardButton(text='➡️', callback_data=f'admin_ticket_page_{ticket_id}_{page + 1}')
             )
-        try:
+        if getattr(keyboard, 'inline_keyboard', None) is not None:
             keyboard.inline_keyboard.insert(0, nav_row)
-        except Exception:
-            pass
 
     page_text = pages[page - 1]
 
@@ -775,8 +775,8 @@ async def handle_admin_block_duration_input(message: types.Message, state: FSMCo
             ticket_text += f'👤 Пользователь: {user_name}\n'
             ticket_text += f'📝 Заголовок: {html.escape(updated.title)}\n'
             ticket_text += f'📊 Статус: {updated.status_emoji} {status_text}\n'
-            ticket_text += f'📅 Создан: {updated.created_at.strftime("%d.%m.%Y %H:%M")}\n'
-            ticket_text += f'🔄 Обновлен: {updated.updated_at.strftime("%d.%m.%Y %H:%M")}\n'
+            ticket_text += f'📅 Создан: {format_local_datetime(updated.created_at, "%d.%m.%Y %H:%M")}\n'
+            ticket_text += f'🔄 Обновлен: {format_local_datetime(updated.updated_at, "%d.%m.%Y %H:%M")}\n'
             if updated.user and updated.user.telegram_id:
                 ticket_text += f'🆔 Telegram ID: <code>{updated.user.telegram_id}</code>\n'
                 if updated.user.username:
@@ -800,12 +800,14 @@ async def handle_admin_block_duration_input(message: types.Message, state: FSMCo
                 if updated.user_reply_block_permanent:
                     ticket_text += '🚫 Пользователь заблокирован навсегда для ответов в этом тикете\n'
                 elif updated.user_reply_block_until:
-                    ticket_text += f'⏳ Блок до: {updated.user_reply_block_until.strftime("%d.%m.%Y %H:%M")}\n'
+                    ticket_text += (
+                        f'⏳ Блок до: {format_local_datetime(updated.user_reply_block_until, "%d.%m.%Y %H:%M")}\n'
+                    )
             if updated.messages:
                 ticket_text += f'💬 Сообщения ({len(updated.messages)}):\n\n'
                 for msg in updated.messages:
                     sender = '👤 Пользователь' if msg.is_user_message else '🛠️ Поддержка'
-                    ticket_text += f'{sender} ({msg.created_at.strftime("%d.%m %H:%M")}):\n'
+                    ticket_text += f'{sender} ({format_local_datetime(msg.created_at, "%d.%m %H:%M")}):\n'
                     ticket_text += f'{html.escape(msg.message_text)}\n\n'
                     if getattr(msg, 'has_media', False) and getattr(msg, 'media_type', None) == 'photo':
                         ticket_text += '📎 Вложение: фото\n\n'
@@ -992,6 +994,40 @@ async def block_user_permanently(callback: types.CallbackQuery, db_user: User, d
         await callback.answer('❌ Ошибка', show_alert=True)
 
 
+async def _notify_ticket_reply_by_email(user: User, ticket: Ticket, reply_text: str, db: AsyncSession) -> None:
+    """Доставить ответ поддержки письмом — для пользователей без ``telegram_id``.
+
+    Тумблер уведомлений общий с Telegram-каналом и уже проверен вызывающей
+    функцией.
+    """
+    if not getattr(user, 'email', None) or not getattr(user, 'email_verified', False):
+        logger.warning(
+            'Cannot notify ticket user: no telegram_id and no verified email',
+            ticket_id=ticket.id,
+            username=getattr(user, 'username', None),
+            auth_type=getattr(user, 'auth_type', None),
+        )
+        return
+
+    try:
+        last_message = await TicketMessageCRUD.get_last_message(db, ticket.id)
+        has_photo = bool(
+            last_message
+            and last_message.has_media
+            and last_message.media_type == 'photo'
+            and last_message.is_from_admin
+        )
+
+        await notification_delivery_service.notify_ticket_reply(
+            user=user,
+            ticket_id=ticket.id,
+            reply_preview=preview_text(reply_text),
+            has_photo=has_photo,
+        )
+    except Exception as error:
+        logger.error('Не удалось отправить email об ответе в тикете', ticket_id=ticket.id, error=error)
+
+
 async def notify_user_about_ticket_reply(bot: Bot, ticket: Ticket, reply_text: str, db: AsyncSession):
     """Уведомить пользователя о новом ответе в тикете"""
     try:
@@ -1014,12 +1050,9 @@ async def notify_user_about_ticket_reply(bot: Bot, ticket: Ticket, reply_text: s
             return
 
         if not getattr(user, 'telegram_id', None):
-            logger.warning(
-                'Cannot notify ticket user without telegram_id',
-                ticket_id=ticket.id,
-                getattr=getattr(user, 'username', None),
-                getattr_2=getattr(user, 'auth_type', None),
-            )
+            # Юзер без Telegram (регистрация по email) иначе узнаёт об ответе
+            # поддержки, только если сам зайдёт в кабинет.
+            await _notify_ticket_reply_by_email(user, ticket, reply_text, db)
             return
 
         chat_id = int(user.telegram_id)

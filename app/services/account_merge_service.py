@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 import structlog
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -37,6 +37,7 @@ from app.database.models import (
     PollResponse,
     PromoCode,
     PromoCodeUse,
+    PromoGroup,
     PromoOfferLog,
     PromoOfferTemplate,
     ReferralContest,
@@ -67,6 +68,7 @@ from app.database.models import (
     YooKassaPayment,
 )
 from app.external.remnawave_api import RemnaWaveAPI
+from app.services.panel_sync import patch_panel_account
 
 
 logger = structlog.get_logger(__name__)
@@ -110,6 +112,23 @@ def compute_auth_methods(user: User) -> list[str]:
         if getattr(user, column, None):
             methods.append(provider)
     return methods
+
+
+async def _count_referrals(db: AsyncSession, user_id: int) -> int:
+    """Сколько людей пришло по реферальной ссылке аккаунта (User.referred_by_id)."""
+    result = await db.execute(select(func.count()).select_from(User).where(User.referred_by_id == user_id))
+    value = result.scalar()
+    return int(value) if isinstance(value, int) else 0
+
+
+async def _promo_group_priority(db: AsyncSession, group_id: int | None) -> int:
+    """Приоритет промогруппы по id; без группы — 0. Запросом, а не через relationship:
+    ленивая связь в async-сессии не загружается."""
+    if group_id is None:
+        return 0
+    result = await db.execute(select(PromoGroup.priority).where(PromoGroup.id == group_id))
+    value = result.scalar()
+    return int(value) if isinstance(value, int) else 0
 
 
 def _build_subscription_preview(sub: Subscription | None) -> dict[str, Any] | None:
@@ -206,7 +225,28 @@ async def _get_remnawave_api() -> AsyncIterator[RemnaWaveAPI]:
 
 
 async def _delete_remnawave_user_with_fallback(remnawave_id: int) -> None:
-    """Удаляет пользователя из RemnaWave. При неудаче — деактивирует как fallback."""
+    """Убирает лишний аккаунт из RemnaWave. При неудаче — деактивирует как fallback.
+
+    Что значит «убирает», решает ``REMNAWAVE_USER_DELETE_MODE``: при ``disable``
+    аккаунт слитого профиля только отключается — админ, запретивший удаление
+    аккаунтов панели, не ждёт исключения для мержа.
+    """
+    if settings.get_remnawave_user_delete_mode() != 'delete':
+        try:
+            async with _get_remnawave_api() as api:
+                await api.disable_user(remnawave_id)
+                logger.info(
+                    'RemnaWave пользователь деактивирован при мерже (режим disable)',
+                    remnawave_id=remnawave_id,
+                )
+        except Exception:
+            logger.warning(
+                'Не удалось деактивировать RemnaWave пользователя при мерже',
+                remnawave_id=remnawave_id,
+                exc_info=True,
+            )
+        return
+
     try:
         async with _get_remnawave_api() as api:
             # 3.0.0: DELETE отвечает 204/202 без тела, поля isDeleted больше нет —
@@ -279,7 +319,8 @@ async def _sync_transferred_subscriptions_to_panel(
         async with _get_remnawave_api() as api:
             for sub in subs_with_panel_id:
                 try:
-                    await api.update_user(
+                    await patch_panel_account(
+                        api,
                         user_id=sub.remnawave_id,
                         description=new_description,
                         telegram_id=primary.telegram_id,
@@ -306,6 +347,141 @@ async def _sync_transferred_subscriptions_to_panel(
             subscription_count=len(subs_with_panel_id),
             exc_info=True,
         )
+
+
+# Предел обхода реферальной цепочки при слиянии. Совпадает по смыслу с
+# MAX_REFERRAL_DEPTH в админской карте сети: страховка от порчи данных, а не
+# продуктовое ограничение.
+_MERGE_CHAIN_MAX_DEPTH = 50
+
+# Сколько пар (реферер, реферал) пересчитывать по уровню за одно слияние.
+# Слияния делает админ вручную и они редки, но выродившийся аккаунт с тысячами
+# рефералов не должен превращать слияние в многоминутную операцию.
+_MERGE_LEVEL_REPAIR_LIMIT = 500
+
+
+async def _break_referral_cycle_through(db: AsyncSession, primary: User) -> bool:
+    """Разорвать цикл, в который слияние могло замкнуть цепочку.
+
+    Секция 9 переводит рефералов secondary на primary. Если primary сам был
+    приглашён одним из них (X → secondary, primary → X), после перевода выходит
+    primary → X → primary. Проверок self-referral для этого мало: петля из двух
+    и более звеньев их не задевает.
+
+    Цикл не подвешивает начисления — обход цепочки в движке наград защищён
+    множеством посещённых, — но молча обрезает всю ветку до первого уровня:
+    уровни 2+ перестают платить, и никто об этом не узнает.
+
+    Рвётся ТОЛЬКО петля, проходящая через самого primary, — та, которую и создало
+    слияние. Петля выше по цепочке (B→C→B) к слиянию отношения не имеет: снять там
+    привязку primary значит уничтожить работающую связь с его законным реферером и
+    при этом оставить настоящую петлю нетронутой. Такие данные чинятся отдельно и
+    осознанно, а не побочным эффектом слияния аккаунтов.
+
+    Какое из двух звеньев резать в петле через primary, задаёт секция 9: рефералы
+    secondary становятся рефералами primary, значит связь «primary приглашён своим
+    же новым рефералом» и есть лишняя.
+
+    Флаш не нужен: перепривязка выше сделана ``update()``-запросами, которые уже
+    ушли в БД, а собственная привязка primary читается из Python-атрибута.
+    """
+    seen = {primary.id}
+    current_id = primary.referred_by_id
+    depth = 0
+
+    while current_id and depth < _MERGE_CHAIN_MAX_DEPTH:
+        if current_id == primary.id:
+            logger.warning(
+                'Слияние замкнуло реферальную цепочку в цикл, привязка primary снята',
+                primary_id=primary.id,
+            )
+            primary.referred_by_id = None
+            return True
+        if current_id in seen:
+            logger.warning(
+                'В реферальной цепочке выше primary есть цикл; слияние его не создавало и не чинит',
+                primary_id=primary.id,
+                repeated_id=current_id,
+            )
+            return False
+        seen.add(current_id)
+        result = await db.execute(select(User.referred_by_id).where(User.id == current_id))
+        current_id = result.scalar_one_or_none()
+        depth += 1
+
+    return False
+
+
+async def _repair_referral_levels(db: AsyncSession, primary: User) -> int:
+    """Привести ``level`` перенесённых начислений в соответствие с новой цепочкой.
+
+    Только для режима цепочки. В режиме рангов ``level`` означает не расстояние,
+    а ступень партнёра, и пересчитывать его по глубине нельзя — вызывающий это
+    и проверяет.
+
+    Уровень строки — это расстояние между реферером и рефералом на момент
+    начисления. Слияние это расстояние меняет: реферал уровня 2 у secondary может
+    стать прямым рефералом primary. Перенесённая строка при этом сохраняет
+    level=2, а ``count_level_payments`` для уровня 1 её не видит — и лимит
+    ``max_payments`` для этой пары начинается заново, то есть пара получает
+    оплату сверх настроенной.
+
+    Пересчитывается только то, что можно посчитать: глубина от реферала вверх до
+    primary. Если связь после слияния разорвана, уровень не трогаем — выдумывать
+    его хуже, чем оставить исторический.
+    """
+    pairs_result = await db.execute(
+        select(ReferralEarning.referral_id).where(ReferralEarning.user_id == primary.id).distinct()
+    )
+    referral_ids = [row[0] for row in pairs_result.all() if row[0] is not None]
+
+    if len(referral_ids) > _MERGE_LEVEL_REPAIR_LIMIT:
+        logger.warning(
+            'Слишком много пар для пересчёта уровней, пересчёт пропущен',
+            primary_id=primary.id,
+            pairs=len(referral_ids),
+        )
+        return 0
+
+    repaired = 0
+    for referral_id in referral_ids:
+        depth = await _distance_to_referrer(db, referral_id, primary.id)
+        if depth is None:
+            continue
+        result = await db.execute(
+            update(ReferralEarning)
+            .where(
+                ReferralEarning.user_id == primary.id,
+                ReferralEarning.referral_id == referral_id,
+                ReferralEarning.level != depth,
+            )
+            .values(level=depth)
+        )
+        repaired += result.rowcount or 0
+
+    if repaired:
+        logger.info('Уровни реферальных начислений пересчитаны после слияния', primary_id=primary.id, rows=repaired)
+    return repaired
+
+
+async def _distance_to_referrer(db: AsyncSession, referral_id: int, referrer_id: int) -> int | None:
+    """Сколько звеньев вверх от реферала до реферера. ``None`` — связи нет."""
+    seen = {referral_id}
+    current_id = referral_id
+    depth = 0
+
+    while depth < _MERGE_CHAIN_MAX_DEPTH:
+        result = await db.execute(select(User.referred_by_id).where(User.id == current_id))
+        parent_id = result.scalar_one_or_none()
+        if not parent_id or parent_id in seen:
+            return None
+        depth += 1
+        if parent_id == referrer_id:
+            return depth
+        seen.add(parent_id)
+        current_id = parent_id
+
+    return None
 
 
 async def _handle_subscription_merge(
@@ -628,27 +804,51 @@ async def execute_merge(
             secondary_id=secondary.id,
         )
 
-    # 3. Перенос email + password (unique constraint на email — тот же паттерн)
-    if not primary.email and secondary.email:
+    # 3. Перенос email + password (unique constraint на email — тот же паттерн).
+    # Email у аккаунта один, поэтому остаётся тот, за которым стоит способ входа:
+    # пароль — осознанный логин, email от OAuth-провайдера — производный (сам вход
+    # через провайдера сохраняется по provider id). Раньше email с паролем
+    # поглощаемого аккаунта пропадал, стоило инициатору иметь любой email — хотя
+    # страница объединения обещает «все способы входа объединятся» (жалоба 2026-09-14).
+    # Источник подтверждения едет вместе с email: пустой источник считается доверенным
+    # для ADMIN_EMAILS, и терять его — значит доверять непроверенному адресу.
+    secondary_login_wins = bool(secondary.password_hash) and not primary.password_hash
+    if secondary.email and (not primary.email or secondary_login_wins):
+        replaced_email = primary.email
         transferred_email = secondary.email
         transferred_verified = secondary.email_verified
         transferred_verified_at = secondary.email_verified_at
+        transferred_source = getattr(secondary, 'email_verification_source', None)
         transferred_password_hash = secondary.password_hash
         # Очищаем на secondary и flush перед установкой на primary
         secondary.email = None
         secondary.email_verified = False
         secondary.email_verified_at = None
+        secondary.email_verification_source = None
         secondary.password_hash = None
         await db.flush()
         primary.email = transferred_email
         primary.email_verified = transferred_verified
         primary.email_verified_at = transferred_verified_at
+        primary.email_verification_source = transferred_source
         primary.password_hash = transferred_password_hash
+        if replaced_email:
+            # Хвосты, привязанные к вытесненному адресу: смена email и сброс пароля.
+            primary.email_change_new = None
+            primary.email_change_code = None
+            primary.email_change_expires = None
+            primary.password_reset_token = None
+            primary.password_reset_expires = None
         logger.info(
             'Перенесены email и пароль',
             primary_id=primary.id,
             secondary_id=secondary.id,
+            replaced_oauth_email=bool(replaced_email),
         )
+
+    # Рефералов считаем ДО переназначения цепочки (§9): после него они все у primary.
+    absorbed_referrals = await _count_referrals(db, secondary.id) if secondary.referral_code else 0
+    keep_absorbed_referral_code = absorbed_referrals > 0 and await _count_referrals(db, primary.id) == 0
 
     # 4. Суммируем баланс (включая отрицательный — долг не должен исчезать)
     transferred_kopeks = secondary.balance_kopeks
@@ -766,6 +966,16 @@ async def execute_merge(
     if primary.referred_by_id is None and secondary.referred_by_id is not None:
         if secondary.referred_by_id != primary.id:
             primary.referred_by_id = secondary.referred_by_id
+
+    # 9b. Петля из двух и более звеньев проверками на self-referral выше не ловится.
+    await _break_referral_cycle_through(db, primary)
+
+    # 9c. Уровень перенесённых начислений мог перестать соответствовать цепочке.
+    # Только в режиме цепочки: там level — расстояние, и слияние его меняет.
+    # В режиме рангов level это ступень партнёра, расстояние всегда 1, и пересчёт
+    # переписал бы ранг в единицу — обнулив вместе с ним и учёт лимита выплат.
+    if settings.is_referral_levels_scheme() and not settings.is_referral_tier_levels():
+        await _repair_referral_levels(db, primary)
 
     # 10. Переназначение withdrawal_requests
     await db.execute(
@@ -989,6 +1199,45 @@ async def execute_merge(
             value=primary.referral_commission_percent,
         )
 
+    # 13a. Реферальный код — один на аккаунт. Остаётся тот, по которому люди уже
+    # приходили: иначе разосланная ссылка поглощённого аккаунта умирает вместе с ним.
+    # Оба в ходу или оба без рефералов — остаётся код инициатора.
+    if keep_absorbed_referral_code:
+        transferred_code = secondary.referral_code
+        secondary.referral_code = None
+        await db.flush()  # unique constraint
+        primary.referral_code = transferred_code
+        logger.info(
+            'Перенесён реферальный код (по нему уже приходили люди)',
+            primary_id=primary.id,
+            secondary_id=secondary.id,
+            referrals=absorbed_referrals,
+        )
+
+    # 13b. Промогруппа — остаётся более высокая по приоритету: скидки не должны пропасть.
+    secondary_group_id = getattr(secondary, 'promo_group_id', None)
+    if secondary_group_id is not None:
+        primary_group_id = getattr(primary, 'promo_group_id', None)
+        secondary_priority = await _promo_group_priority(db, secondary_group_id)
+        primary_priority = await _promo_group_priority(db, primary_group_id)
+        if primary_group_id is None or secondary_priority > primary_priority:
+            primary.promo_group_id = secondary_group_id
+            logger.info(
+                'Перенесена промогруппа',
+                primary_id=primary.id,
+                secondary_id=secondary.id,
+                promo_group_id=secondary_group_id,
+            )
+
+    # 13c. Дата регистрации — самая ранняя: «история сохранится».
+    if secondary.created_at and (primary.created_at is None or secondary.created_at < primary.created_at):
+        primary.created_at = secondary.created_at
+
+    # 13d. Пустые поля профиля заполняем из поглощённого аккаунта; язык и заполненное не трогаем.
+    for field in ('username', 'first_name', 'last_name'):
+        if not getattr(primary, field, None) and getattr(secondary, field, None):
+            setattr(primary, field, getattr(secondary, field))
+
     # 14. Помечаем secondary как удалённый и очищаем ВСЕ unique constraint и FK поля
     # NOTE: In multi-tariff mode, all secondary subscriptions were already transferred to primary
     # in _handle_subscription_merge. Do NOT clear their remnawave_id — they are now primary's subs.
@@ -1002,6 +1251,7 @@ async def execute_merge(
     secondary.email = None
     secondary.email_verified = False
     secondary.email_verified_at = None
+    secondary.email_verification_source = None
     secondary.email_verification_token = None
     secondary.email_verification_expires = None
     secondary.email_change_new = None

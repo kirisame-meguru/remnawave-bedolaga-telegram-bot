@@ -21,6 +21,7 @@ from app.config import settings
 from app.database.crud.referral import create_referral_earning, get_user_campaign_id
 from app.database.crud.user import add_user_balance
 from app.database.models import ReferralEarning, User
+from app.utils.timezone import local_date, local_day_bounds
 
 
 logger = structlog.get_logger(__name__)
@@ -263,6 +264,10 @@ class MissingBonusReport:
     total_missing_to_referrals: int = 0  # Всего не начислено рефералам
     total_missing_to_referrers: int = 0  # Всего не начислено рефереерам
 
+    # Проверка неприменима: включена многоуровневая схема, а весь детектор и
+    # доначисление считают суммы по легаси-ключам REFERRAL_*.
+    unsupported_scheme: bool = False
+
     def to_dict(self) -> dict:
         """Сериализация для Redis."""
         return {
@@ -271,6 +276,7 @@ class MissingBonusReport:
             'missing_bonuses': [mb.to_dict() for mb in self.missing_bonuses],
             'total_missing_to_referrals': self.total_missing_to_referrals,
             'total_missing_to_referrers': self.total_missing_to_referrers,
+            'unsupported_scheme': self.unsupported_scheme,
         }
 
     @classmethod
@@ -283,6 +289,7 @@ class MissingBonusReport:
             missing_bonuses=missing_bonuses,
             total_missing_to_referrals=data.get('total_missing_to_referrals', 0),
             total_missing_to_referrers=data.get('total_missing_to_referrers', 0),
+            unsupported_scheme=data.get('unsupported_scheme', False),
         )
 
 
@@ -305,13 +312,13 @@ class ReferralDiagnosticsService:
 
     def _find_log_file(self) -> Path:
         """Ищет существующий лог-файл, предпочитая свежие."""
-        today = datetime.now(UTC).date()
+        today = local_date()
         candidates = []
 
         for path_str in self.LOG_PATHS:
             path = Path(path_str)
             if path.exists() and path.stat().st_size > 0:
-                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).date()
+                mtime = local_date(datetime.fromtimestamp(path.stat().st_mtime, tz=UTC))
                 is_fresh = mtime >= today - timedelta(days=1)
                 candidates.append((path, is_fresh, path.stat().st_mtime))
                 logger.info('📁 Найден лог', path=path, is_fresh=is_fresh)
@@ -339,8 +346,7 @@ class ReferralDiagnosticsService:
 
     async def analyze_today(self, db: AsyncSession) -> DiagnosticReport:
         """Анализирует реферальные события за сегодня."""
-        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-        tomorrow = today + timedelta(days=1)
+        today, tomorrow = local_day_bounds()
         return await self.analyze_period(db, today, tomorrow)
 
     async def analyze_period(self, db: AsyncSession, start_date: datetime, end_date: datetime) -> DiagnosticReport:
@@ -746,7 +752,16 @@ class ReferralDiagnosticsService:
                 )
                 first_topup = first_topup_result.scalar_one_or_none()
 
-                if first_topup and first_topup.amount_kopeks >= settings.REFERRAL_MINIMUM_TOPUP_KOPEKS:
+                # Восстановление ПРИВЯЗКИ реферала выше безопасно при любой схеме.
+                # Доначисление бонусов — нет: ниже суммы считаются по легаси-ключам
+                # REFERRAL_*, которые в многоуровневой схеме ничем не управляют.
+                bonus_backfill_supported = not settings.is_referral_levels_scheme()
+
+                if (
+                    bonus_backfill_supported
+                    and first_topup
+                    and first_topup.amount_kopeks >= settings.REFERRAL_MINIMUM_TOPUP_KOPEKS
+                ):
                     detail.had_first_topup = True
                     detail.topup_amount_kopeks = first_topup.amount_kopeks
 
@@ -867,6 +882,16 @@ class ReferralDiagnosticsService:
 
         report = MissingBonusReport()
 
+        # Детектор ищет ОТСУТСТВИЕ строки с легаси-причиной и считает суммы по
+        # ключам REFERRAL_*. В многоуровневой схеме начисление могло пройти по
+        # другому поводу (регистрация, каждое пополнение) или вовсе днями — такую
+        # пару детектор считает «пропущенной» и доначислил бы деньги ПОВЕРХ уже
+        # выданного. Поэтому на схеме 'levels' проверка не выполняется вовсе.
+        if settings.is_referral_levels_scheme():
+            report.unsupported_scheme = True
+            logger.info('Проверка пропущенных бонусов пропущена: включена многоуровневая схема')
+            return report
+
         # 1. Находим всех рефералов (у кого есть referred_by_id)
         referrals_result = await db.execute(select(User).where(User.referred_by_id.isnot(None)))
         referrals = referrals_result.scalars().all()
@@ -977,6 +1002,16 @@ class ReferralDiagnosticsService:
         report = FixReport()
 
         if not missing_bonuses:
+            return report
+
+        # Вторая линия защиты: отчёт мог быть построен ДО переключения схемы и
+        # пролежать в Redis. Начислять по нему легаси-суммы на многоуровневой
+        # установке — это выплата поверх уже выданного, деньгами и повторно.
+        if settings.is_referral_levels_scheme():
+            logger.warning(
+                'Доначисление бонусов отклонено: включена многоуровневая схема',
+                missing_count=len(missing_bonuses),
+            )
             return report
 
         # Загружаем пользователей

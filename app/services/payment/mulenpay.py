@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.models import PaymentMethod, TransactionType
+from app.services.payment.payer_identity import payer_from_guest, resolve_user_payer
 from app.utils.payment_logger import payment_logger as logger
 from app.utils.user_utils import format_referrer_info
 
@@ -25,8 +26,14 @@ class MulenPayPaymentMixin:
         amount_kopeks: int,
         description: str,
         language: str | None = None,
+        client: str | None = None,
     ) -> dict[str, Any] | None:
-        """Создаёт локальный платеж и инициализирует сессию в MulenPay."""
+        """Создаёт локальный платеж и инициализирует сессию в MulenPay.
+
+        ``client`` — контакт плательщика-гостя; у пользователя он читается по
+        ``user_id``. MulenPay (письмо провайдера 2026-09-15) требует поле в каждом
+        платеже: «почтой, телефоном или ТГ ид и т.п.» — см. payer_identity.
+        """
         display_name = settings.get_mulenpay_display_name()
         settings.get_mulenpay_display_name_html()
         if not getattr(self, 'mulenpay_service', None):
@@ -56,6 +63,13 @@ class MulenPayPaymentMixin:
             payment_uuid = f'mulen_{user_id or "guest"}_{uuid.uuid4().hex}'
             amount_rubles = amount_kopeks / 100
 
+            if client:
+                payer_client = client
+            elif user_id is not None:
+                payer_client = (await resolve_user_payer(db, user_id)).contact
+            else:
+                payer_client = payer_from_guest(payment_uuid, contact_type=None, contact_value=None).contact
+
             items = [
                 {
                     'description': description[:128],
@@ -74,6 +88,7 @@ class MulenPayPaymentMixin:
                 items=items,
                 language=language or settings.MULENPAY_LANGUAGE,
                 website_url=settings.MULENPAY_WEBSITE_URL or settings.WEBHOOK_URL,
+                client=payer_client,
             )
 
             if not response:

@@ -12,6 +12,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.crud.campaign import get_campaign_statistics, get_campaigns_count, get_campaigns_list
+from app.database.crud.referral import not_referee_directed
 from app.database.crud.server_squad import get_server_statistics
 from app.database.crud.subscription import get_subscriptions_statistics
 from app.database.crud.transaction import REAL_PAYMENT_METHODS, get_revenue_by_period, get_transactions_statistics
@@ -26,6 +27,7 @@ from app.database.models import (
 )
 from app.services.remnawave_service import RemnaWaveService
 from app.services.version_service import version_service
+from app.utils.timezone import local_day_start, local_month_start
 
 from ..dependencies import get_cabinet_db, require_permission
 
@@ -173,6 +175,9 @@ class TopReferrerItem(BaseModel):
     earnings_week_kopeks: int = 0
     earnings_month_kopeks: int = 0
     earnings_total_kopeks: int = 0
+    # Дни — вторая валюта программы: без них лидерборд «дневной» установки
+    # состоит из нулей, а лучший реферер не отличим от неактивного.
+    earnings_total_days: int = 0
 
 
 class TopReferrersResponse(BaseModel):
@@ -256,7 +261,7 @@ async def get_dashboard_stats(
 
         # Get financial statistics
         now = datetime.now(UTC)
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_start = local_month_start(now)
 
         trans_stats = await get_transactions_statistics(db, month_start, now)
         all_time_stats = await get_transactions_statistics(
@@ -272,13 +277,9 @@ async def get_dashboard_stats(
         # Get tariff statistics
         tariff_stats = await _get_tariff_stats(db)
 
-        # Derive income_today from revenue_chart to ensure consistency with chart
-        today_str = now.date().isoformat()
-        income_today_from_chart = sum(
-            item.get('amount_kopeks', 0) for item in revenue_data if str(item.get('date', '')) == today_str
-        )
-        # Use chart-derived value if available, otherwise fall back to trans_stats
-        income_today_kopeks = income_today_from_chart or trans_stats.get('today', {}).get('income_kopeks', 0)
+        # «Сегодня» у сводки, графика и бота — один календарный день settings.TIMEZONE,
+        # поэтому пересчитывать сводку из графика по строке даты UTC больше не нужно (#3136).
+        income_today_kopeks = trans_stats.get('today', {}).get('income_kopeks', 0)
 
         # Build response
         return DashboardStats(
@@ -509,7 +510,7 @@ async def _get_tariff_stats(db: AsyncSession) -> TariffStats | None:
             return None
 
         now = datetime.now(UTC)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = local_day_start(now)
         week_ago = now - timedelta(days=7)
         month_ago = now - timedelta(days=30)
 
@@ -607,7 +608,7 @@ async def get_top_referrers(
     """Get top referrers with earnings breakdown by period."""
     try:
         now = datetime.now(UTC)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = local_day_start(now)
         week_ago = now - timedelta(days=7)
         month_ago = now - timedelta(days=30)
 
@@ -652,19 +653,31 @@ async def get_top_referrers(
 
         # Get earnings from ReferralEarning table
         # Total earnings
+        # Подушевой агрегат: not_referee_directed() отбрасывает награды, полученные
+        # человеком КАК ПРИГЛАШЁННЫМ — они не его партнёрский доход. Дни считаются
+        # рядом с деньгами: без них лидерборд «дневной» программы состоит из нулей.
+        #
+        # Тот же предикат стоит и на периодных суммах ниже. Без него «всего» и
+        # «за месяц» считались бы по разным популяциям, и у приглашённого без
+        # единого реферала месячный доход оказывался бы больше общего.
         total_earnings_query = await db.execute(
             select(
-                ReferralEarning.user_id.label('referrer_id'), func.sum(ReferralEarning.amount_kopeks).label('total')
-            ).group_by(ReferralEarning.user_id)
+                ReferralEarning.user_id.label('referrer_id'),
+                func.sum(ReferralEarning.amount_kopeks).label('total'),
+                func.sum(ReferralEarning.days_granted).label('total_days'),
+            )
+            .where(not_referee_directed())
+            .group_by(ReferralEarning.user_id)
         )
         for row in total_earnings_query:
             if row.referrer_id in referrers_data:
                 referrers_data[row.referrer_id]['earnings_total'] = row.total or 0
+                referrers_data[row.referrer_id]['earnings_total_days'] = int(row.total_days or 0)
 
         # Today earnings
         today_earnings_query = await db.execute(
             select(ReferralEarning.user_id.label('referrer_id'), func.sum(ReferralEarning.amount_kopeks).label('total'))
-            .where(ReferralEarning.created_at >= today_start)
+            .where(and_(not_referee_directed(), ReferralEarning.created_at >= today_start))
             .group_by(ReferralEarning.user_id)
         )
         for row in today_earnings_query:
@@ -674,7 +687,7 @@ async def get_top_referrers(
         # Week earnings
         week_earnings_query = await db.execute(
             select(ReferralEarning.user_id.label('referrer_id'), func.sum(ReferralEarning.amount_kopeks).label('total'))
-            .where(ReferralEarning.created_at >= week_ago)
+            .where(and_(not_referee_directed(), ReferralEarning.created_at >= week_ago))
             .group_by(ReferralEarning.user_id)
         )
         for row in week_earnings_query:
@@ -684,7 +697,7 @@ async def get_top_referrers(
         # Month earnings
         month_earnings_query = await db.execute(
             select(ReferralEarning.user_id.label('referrer_id'), func.sum(ReferralEarning.amount_kopeks).label('total'))
-            .where(ReferralEarning.created_at >= month_ago)
+            .where(and_(not_referee_directed(), ReferralEarning.created_at >= month_ago))
             .group_by(ReferralEarning.user_id)
         )
         for row in month_earnings_query:
@@ -739,11 +752,14 @@ async def get_top_referrers(
                     earnings_week_kopeks=data.get('earnings_week', 0),
                     earnings_month_kopeks=data.get('earnings_month', 0),
                     earnings_total_kopeks=data.get('earnings_total', 0),
+                    earnings_total_days=data.get('earnings_total_days', 0),
                 )
             )
 
         # Sort by earnings and by invited
-        by_earnings = sorted(referrer_items, key=lambda x: x.earnings_total_kopeks, reverse=True)[:limit]
+        by_earnings = sorted(
+            referrer_items, key=lambda x: (x.earnings_total_kopeks, x.earnings_total_days), reverse=True
+        )[:limit]
         by_invited = sorted(referrer_items, key=lambda x: x.invited_count, reverse=True)[:limit]
 
         # Calculate totals
@@ -833,7 +849,7 @@ async def get_recent_payments(
     """Get recent payments with user info."""
     try:
         now = datetime.now(UTC)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = local_day_start(now)
         week_ago = now - timedelta(days=7)
 
         # Get recent transactions (deposits and subscription payments)

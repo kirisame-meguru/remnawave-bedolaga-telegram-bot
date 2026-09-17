@@ -22,6 +22,7 @@ from app.services.traffic_monitoring_service import (
 from app.states import AdminStates
 from app.utils.decorators import admin_required
 from app.utils.pagination import paginate_list
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -173,7 +174,7 @@ async def _build_notification_preview_message(language: str, notification_type: 
             ),
         )
         message = template.format(
-            end_date=(now - timedelta(days=1)).strftime('%d.%m.%Y %H:%M'),
+            end_date=format_local_datetime(now - timedelta(days=1), '%d.%m.%Y %H:%M'),
             price=price_30_days,
             tariff_label='',
         )
@@ -212,7 +213,7 @@ async def _build_notification_preview_message(language: str, notification_type: 
         )
         message = template.format(
             percent=percent,
-            expires_at=(now + timedelta(hours=valid_hours)).strftime('%d.%m.%Y %H:%M'),
+            expires_at=format_local_datetime(now + timedelta(hours=valid_hours), '%d.%m.%Y %H:%M'),
             trigger_days=3,
             tariff_label='',
         )
@@ -259,7 +260,7 @@ async def _build_notification_preview_message(language: str, notification_type: 
         message = template.format(
             percent=percent,
             trigger_days=trigger_days,
-            expires_at=(now + timedelta(hours=valid_hours)).strftime('%d.%m.%Y %H:%M'),
+            expires_at=format_local_datetime(now + timedelta(hours=valid_hours), '%d.%m.%Y %H:%M'),
             tariff_label='',
         )
         keyboard = InlineKeyboardMarkup(
@@ -361,7 +362,9 @@ async def admin_monitoring_menu(callback: CallbackQuery):
             status = await monitoring_service.get_monitoring_status(db)
 
             running_status = '🟢 Работает' if status['is_running'] else '🔴 Остановлен'
-            last_update = status['last_update'].strftime('%H:%M:%S') if status['last_update'] else 'Никогда'
+            last_update = (
+                format_local_datetime(status['last_update'], '%H:%M:%S') if status['last_update'] else 'Никогда'
+            )
 
             text = f"""
 🔍 <b>Система мониторинга</b>
@@ -437,7 +440,11 @@ async def admin_notify_settings(callback: CallbackQuery):
 @admin_required
 async def toggle_trial_channel_notification(callback: CallbackQuery):
     enabled = NotificationSettingsService.is_trial_channel_unsubscribed_enabled()
-    NotificationSettingsService.set_trial_channel_unsubscribed_enabled(not enabled)
+    async with AsyncSessionLocal() as db:
+        saved = await NotificationSettingsService.set_trial_channel_unsubscribed_enabled(db, not enabled)
+    if not saved:
+        await callback.answer('❌ Не удалось сохранить настройку', show_alert=True)
+        return
     await callback.answer('✅ Включено' if not enabled else '⏸️ Отключено')
     await _render_notification_settings(callback)
 
@@ -458,7 +465,11 @@ async def preview_trial_channel_notification(callback: CallbackQuery):
 @admin_required
 async def toggle_expired_1d_notification(callback: CallbackQuery):
     enabled = NotificationSettingsService.is_expired_1d_enabled()
-    NotificationSettingsService.set_expired_1d_enabled(not enabled)
+    async with AsyncSessionLocal() as db:
+        saved = await NotificationSettingsService.set_expired_1d_enabled(db, not enabled)
+    if not saved:
+        await callback.answer('❌ Не удалось сохранить настройку', show_alert=True)
+        return
     await callback.answer('✅ Включено' if not enabled else '⏸️ Отключено')
     await _render_notification_settings(callback)
 
@@ -479,7 +490,11 @@ async def preview_expired_1d_notification(callback: CallbackQuery):
 @admin_required
 async def toggle_second_wave_notification(callback: CallbackQuery):
     enabled = NotificationSettingsService.is_second_wave_enabled()
-    NotificationSettingsService.set_second_wave_enabled(not enabled)
+    async with AsyncSessionLocal() as db:
+        saved = await NotificationSettingsService.set_second_wave_enabled(db, not enabled)
+    if not saved:
+        await callback.answer('❌ Не удалось сохранить настройку', show_alert=True)
+        return
     await callback.answer('✅ Включено' if not enabled else '⏸️ Отключено')
     await _render_notification_settings(callback)
 
@@ -500,7 +515,11 @@ async def preview_second_wave_notification(callback: CallbackQuery):
 @admin_required
 async def toggle_third_wave_notification(callback: CallbackQuery):
     enabled = NotificationSettingsService.is_third_wave_enabled()
-    NotificationSettingsService.set_third_wave_enabled(not enabled)
+    async with AsyncSessionLocal() as db:
+        saved = await NotificationSettingsService.set_third_wave_enabled(db, not enabled)
+    if not saved:
+        await callback.answer('❌ Не удалось сохранить настройку', show_alert=True)
+        return
     await callback.answer('✅ Включено' if not enabled else '⏸️ Отключено')
     await _render_notification_settings(callback)
 
@@ -685,7 +704,7 @@ async def force_check_callback(callback: CallbackQuery):
 • Истекающих подписок: {results['expiring']}
 • Готовых к автооплате: {results['autopay_ready']}
 
-🕐 <b>Время проверки:</b> {datetime.now(UTC).strftime('%H:%M:%S')}
+🕐 <b>Время проверки:</b> {format_local_datetime(datetime.now(UTC), '%H:%M:%S')}
 
 Нажмите "Назад" для возврата в меню мониторинга.
 """
@@ -739,7 +758,7 @@ async def traffic_check_callback(callback: CallbackQuery):
 • Порог дельты: {threshold_gb} ГБ
 • Возраст snapshot: {snapshot_age:.1f} мин
 
-🕐 <b>Время проверки:</b> {datetime.now(UTC).strftime('%H:%M:%S')}
+🕐 <b>Время проверки:</b> {format_local_datetime(datetime.now(UTC), '%H:%M:%S')}
 """
 
         if violations:
@@ -796,7 +815,7 @@ async def monitoring_logs_callback(callback: CallbackQuery):
 
             for log in paginated_logs.items:
                 icon = '✅' if log['is_success'] else '❌'
-                time_str = log['created_at'].strftime('%m-%d %H:%M')
+                time_str = format_local_datetime(log['created_at'], '%m-%d %H:%M')
                 event_type = log['event_type'].replace('_', ' ').title()
 
                 message = log['message']
@@ -856,7 +875,7 @@ async def test_notifications_callback(callback: CallbackQuery):
 📊 <b>Статус системы:</b>
 • Мониторинг: {'🟢 Работает' if monitoring_service.is_running else '🔴 Остановлен'}
 • Уведомления: {'🟢 Включены' if settings.ENABLE_NOTIFICATIONS else '🔴 Отключены'}
-• Время теста: {datetime.now(UTC).strftime('%H:%M:%S %d.%m.%Y')}
+• Время теста: {format_local_datetime(datetime.now(UTC), '%H:%M:%S %d.%m.%Y')}
 
 ✅ Если вы получили это сообщение, система уведомлений работает корректно!
 """
@@ -1683,17 +1702,18 @@ async def process_notification_value_input(message: Message, state: FSMContext):
             await message.answer('❌ Количество дней должно быть не менее 2.')
             return
 
+    setters = {
+        ('expired_second_wave', 'percent'): NotificationSettingsService.set_second_wave_discount_percent,
+        ('expired_second_wave', 'hours'): NotificationSettingsService.set_second_wave_valid_hours,
+        ('expired_third_wave', 'percent'): NotificationSettingsService.set_third_wave_discount_percent,
+        ('expired_third_wave', 'hours'): NotificationSettingsService.set_third_wave_valid_hours,
+        ('expired_third_wave', 'trigger'): NotificationSettingsService.set_third_wave_trigger_days,
+    }
+    setter = setters.get((key, field))
     success = False
-    if key == 'expired_second_wave' and field == 'percent':
-        success = NotificationSettingsService.set_second_wave_discount_percent(value)
-    elif key == 'expired_second_wave' and field == 'hours':
-        success = NotificationSettingsService.set_second_wave_valid_hours(value)
-    elif key == 'expired_third_wave' and field == 'percent':
-        success = NotificationSettingsService.set_third_wave_discount_percent(value)
-    elif key == 'expired_third_wave' and field == 'hours':
-        success = NotificationSettingsService.set_third_wave_valid_hours(value)
-    elif key == 'expired_third_wave' and field == 'trigger':
-        success = NotificationSettingsService.set_third_wave_trigger_days(value)
+    if setter is not None:
+        async with AsyncSessionLocal() as db:
+            success = await setter(db, value)
 
     if not success:
         await message.answer(texts.get('NOTIFICATION_VALUE_INVALID', '❌ Некорректное значение, попробуйте снова.'))
@@ -1930,7 +1950,7 @@ async def edit_daily_time(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
     await callback.message.answer(
-        '🕐 Введите время суточной проверки в формате HH:MM (UTC):\nНапример: 00:00, 03:00, 12:30'
+        '🕐 Введите время суточной проверки в формате HH:MM (в часовом поясе бота):\nНапример: 00:00, 03:00, 12:30'
     )
 
 

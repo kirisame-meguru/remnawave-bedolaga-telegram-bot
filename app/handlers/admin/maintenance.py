@@ -12,6 +12,7 @@ from app.localization.texts import get_texts
 from app.services.maintenance_service import maintenance_service
 from app.services.system_settings_service import bot_configuration_service
 from app.utils.decorators import admin_required, error_handler
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -20,6 +21,21 @@ logger = structlog.get_logger(__name__)
 class MaintenanceStates(StatesGroup):
     waiting_for_reason = State()
     waiting_for_notification_message = State()
+
+
+# Дописывается к ответу, когда MAINTENANCE_MODE задан в .env. Такой ключ попадает
+# в ENV_OVERRIDE_KEYS: переключение ложится в БД, но к настройкам не применяется, и
+# на старте set_bot читает значение из окружения. Без этого предупреждения админ
+# видит «выключено», а после перезапуска техработы включаются снова — и выглядит
+# это как самопроизвольное включение.
+_ENV_LOCKED_WARNING = (
+    '\n\n⚠️ MAINTENANCE_MODE задан в .env, поэтому переключение не переживёт '
+    'перезапуск. Уберите строку из .env, чтобы управлять режимом отсюда.'
+)
+
+
+def _maintenance_env_locked() -> bool:
+    return bot_configuration_service.is_env_overridden('MAINTENANCE_MODE')
 
 
 async def _persist_maintenance_mode(db: AsyncSession, enabled: bool) -> None:
@@ -57,14 +73,14 @@ async def show_maintenance_panel(callback: types.CallbackQuery, db_user: User, d
 
     enabled_info = ''
     if status_info['is_active'] and status_info['enabled_at']:
-        enabled_time = status_info['enabled_at'].strftime('%d.%m.%Y %H:%M:%S')
+        enabled_time = format_local_datetime(status_info['enabled_at'], '%d.%m.%Y %H:%M:%S')
         enabled_info = f'\n📅 <b>Включен:</b> {enabled_time}'
         if status_info['reason']:
             enabled_info += f'\n📝 <b>Причина:</b> {status_info["reason"]}'
 
     last_check_info = ''
     if status_info['last_check']:
-        last_check_time = status_info['last_check'].strftime('%H:%M:%S')
+        last_check_time = format_local_datetime(status_info['last_check'], '%H:%M:%S')
         last_check_info = f'\n🕐 <b>Последняя проверка:</b> {last_check_time}'
 
     failures_info = ''
@@ -114,7 +130,10 @@ async def toggle_maintenance_mode(callback: types.CallbackQuery, db_user: User, 
         if success:
             await _persist_maintenance_mode(db, False)
         if success:
-            await callback.answer('Режим техработ выключен', show_alert=True)
+            text = 'Режим техработ выключен'
+            if _maintenance_env_locked():
+                text += _ENV_LOCKED_WARNING
+            await callback.answer(text, show_alert=True)
         else:
             await callback.answer('Ошибка выключения режима техработ', show_alert=True)
     else:
@@ -149,6 +168,8 @@ async def process_maintenance_reason(message: types.Message, db_user: User, db: 
         response_text = 'Режим техработ включен'
         if reason:
             response_text += f'\nПричина: {html.escape(reason)}'
+        if _maintenance_env_locked():
+            response_text += _ENV_LOCKED_WARNING
     else:
         response_text = 'Ошибка включения режима техработ'
 

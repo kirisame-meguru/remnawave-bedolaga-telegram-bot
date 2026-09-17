@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import ipaddress
 import json
 
 import structlog
@@ -73,29 +72,20 @@ def _create_cors_response() -> Response:
 
 
 def _resolve_proxied_client_ip(request: Request) -> str | None:
-    """Resolve the client IP without trusting attacker-settable forwarding headers.
+    """Адрес отправителя вебхука без доверия к клиентским заголовкам.
 
-    A direct connection from a public peer uses that peer address; client-supplied X-Real-IP /
-    X-Forwarded-For are honoured only when the immediate peer is a local/private reverse proxy
-    (the only party trusted to have set them). Otherwise an attacker could forge a whitelisted
-    source IP to pass a webhook IP-allowlist check.
+    Те же правила, что у ЮKassa (``resolve_webhook_client_ip``): публичный peer — он и
+    есть отправитель; за локальным/доверенным прокси читается только ``X-Forwarded-For``
+    справа налево, ``X-Real-IP`` — лишь когда ``X-Forwarded-For`` нет; ``Cf-Connecting-Ip``
+    — только от peer из сетей Cloudflare; неизвестный peer → ``None``.
     """
-    peer = request.client.host if request.client else None
-
-    def _is_local_proxy(ip: str | None) -> bool:
-        if not ip:
-            return False
-        try:
-            addr = ipaddress.ip_address(ip)
-        except ValueError:
-            return False
-        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
-
-    if peer and not _is_local_proxy(peer):
-        return peer
-
-    forwarded = request.headers.get('x-real-ip') or request.headers.get('x-forwarded-for', '').split(',')[0].strip()
-    return forwarded or peer
+    client_ip = yookassa_webhook_module.resolve_webhook_client_ip(
+        request.client.host if request.client else None,
+        forwarded_for=request.headers.get('x-forwarded-for'),
+        real_ip=request.headers.get('x-real-ip'),
+        cf_connecting_ip=request.headers.get('cf-connecting-ip'),
+    )
+    return str(client_ip) if client_ip is not None else None
 
 
 def _verify_mulenpay_signature(request: Request, raw_body: bytes) -> bool:
@@ -457,19 +447,16 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
 
         @router.post(settings.YOOKASSA_WEBHOOK_PATH)
         async def yookassa_webhook(request: Request) -> JSONResponse:
-            # IP-гейт можно отключить (YOOKASSA_SKIP_IP_CHECK) для схем за Anti-DDoS/прокси,
-            # который не пробрасывает реальный IP отправителя. В этом режиме подлинность
-            # платежа гарантирует fail-closed API-проверка в process_yookassa_webhook.
+            # IP-гейт — первый барьер; его можно отключить (YOOKASSA_SKIP_IP_CHECK) за
+            # Anti-DDoS/прокси, который не пробрасывает адрес отправителя. Подлинность
+            # платежа в любом режиме подтверждает обязательный запрос в API ЮKassa
+            # внутри process_yookassa_webhook — без подтверждения начисления нет.
             if not settings.YOOKASSA_SKIP_IP_CHECK:
-                header_ip_candidates = yookassa_webhook_module.collect_yookassa_ip_candidates(
-                    request.headers.get('X-Forwarded-For'),
-                    request.headers.get('X-Real-IP'),
-                    request.headers.get('Cf-Connecting-Ip'),
-                )
-                remote_ip = request.client.host if request.client else None
-                client_ip = yookassa_webhook_module.resolve_yookassa_ip(
-                    header_ip_candidates,
-                    remote=remote_ip,
+                client_ip = yookassa_webhook_module.resolve_webhook_client_ip(
+                    request.client.host if request.client else None,
+                    forwarded_for=request.headers.get('X-Forwarded-For'),
+                    real_ip=request.headers.get('X-Real-IP'),
+                    cf_connecting_ip=request.headers.get('Cf-Connecting-Ip'),
                 )
 
                 if client_ip is None:
@@ -1825,6 +1812,132 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
 
         routes_registered = True
 
+    # ParityPay webhook (api.paritypay.net v2)
+    if settings.is_paritypay_configured():
+
+        @router.get(settings.PARITYPAY_WEBHOOK_PATH)
+        async def paritypay_health() -> JSONResponse:
+            return JSONResponse(
+                {
+                    'status': 'ok',
+                    'service': 'paritypay_webhook',
+                    'enabled': settings.is_paritypay_enabled(),
+                }
+            )
+
+        @router.post(settings.PARITYPAY_WEBHOOK_PATH)
+        async def paritypay_webhook(request: Request) -> JSONResponse:
+            raw_body = await request.body()
+
+            from app.services.paritypay_service import paritypay_service
+
+            # Подпись считается по РАЗОБРАННОМУ телу: поля сортируются по ключам,
+            # значения склеиваются. Разбор сохраняет исходный текст чисел, иначе
+            # Python перепишет 1200 как 1200.0 и подпись не сойдётся.
+            payload = paritypay_service.parse_callback_body(raw_body)
+            if payload is None:
+                return JSONResponse({'status': 'error'}, status_code=status.HTTP_400_BAD_REQUEST)
+
+            if not paritypay_service.verify_callback_signature(payload, request.headers.get('X-SIGNATURE')):
+                logger.warning('ParityPay webhook: invalid signature')
+                return JSONResponse({'status': 'error'}, status_code=status.HTTP_400_BAD_REQUEST)
+
+            # Провайдер ждёт HTTP 200 как подтверждение доставки и иначе повторяет
+            # до пяти раз. Подтверждаем сразу после проверки подписи, зачисление
+            # доделываем фоном: обработчик берёт свою сессию БД и блокирует строку
+            # платежа, поэтому параллельные доставки безопасны.
+            async def _process_paritypay_bg() -> None:
+                try:
+                    success = await _process_payment_service_callback(
+                        payment_service,
+                        payload,
+                        'process_paritypay_callback',
+                    )
+                    if not success:
+                        logger.error(
+                            'ParityPay webhook processing failed',
+                            order_id=payload.get('order_id'),
+                            payment_id=payload.get('id'),
+                            payment_status=payload.get('status'),
+                        )
+                except Exception as e:
+                    logger.exception('ParityPay webhook processing error', error=e)
+
+            _spawn_webhook_bg(_process_paritypay_bg())
+            return JSONResponse({'status': 'ok'}, status_code=status.HTTP_200_OK)
+
+        routes_registered = True
+
+    # TabPay webhook (tabpay.org)
+    if settings.is_tabpay_configured():
+
+        @router.get(settings.TABPAY_WEBHOOK_PATH)
+        async def tabpay_health() -> JSONResponse:
+            return JSONResponse(
+                {
+                    'status': 'ok',
+                    'service': 'tabpay_webhook',
+                    'enabled': settings.is_tabpay_enabled(),
+                }
+            )
+
+        @router.post(settings.TABPAY_WEBHOOK_PATH)
+        async def tabpay_webhook(request: Request) -> JSONResponse:
+            # Сырые байты тела: подпись считается ДО разбора JSON, потому что
+            # пересобранный JSON меняет порядок ключей и пробелы.
+            raw_body = await request.body()
+
+            from app.services.tabpay_service import tabpay_service
+
+            # X-Signature-V2 — HMAC-SHA256 от «{X-Timestamp}.{тело}»; окно
+            # свежести метки закрывает переигрывание перехваченного вебхука.
+            if not tabpay_service.verify_webhook_signature(
+                raw_body,
+                request.headers.get('X-Timestamp'),
+                request.headers.get('X-Signature-V2'),
+            ):
+                logger.warning('TabPay webhook: invalid signature')
+                return JSONResponse({'status': 'error'}, status_code=status.HTTP_400_BAD_REQUEST)
+
+            try:
+                payload = json.loads(raw_body)
+            except Exception as parse_error:
+                logger.error('TabPay webhook: failed to parse JSON', parse_error=parse_error)
+                return JSONResponse({'status': 'error'}, status_code=status.HTTP_400_BAD_REQUEST)
+
+            if not isinstance(payload, dict):
+                logger.error('TabPay webhook: тело не является объектом JSON')
+                return JSONResponse({'status': 'error'}, status_code=status.HTTP_400_BAD_REQUEST)
+
+            # TabPay ждёт 2xx за 5 секунд, а зачисление тянет за собой транзакцию,
+            # уведомления и реферальные начисления. Подтверждаем доставку сразу
+            # после проверки подписи, работу доделываем фоном: обработчик берёт
+            # свою сессию БД и блокирует строку платежа, поэтому параллельные
+            # доставки безопасны. Потерянное фоном зачисление подхватит сверка
+            # по API (SUPPORTED_AUTO_CHECK_METHODS), а drain_webhook_bg_tasks
+            # не даёт задаче пропасть при остановке процесса.
+            async def _process_tabpay_bg() -> None:
+                try:
+                    success = await _process_payment_service_callback(
+                        payment_service,
+                        payload,
+                        'process_tabpay_callback',
+                    )
+                    if not success:
+                        logger.error(
+                            'TabPay webhook processing failed',
+                            order_id=payload.get('orderId'),
+                            payment_id=payload.get('id'),
+                            payment_status=payload.get('status'),
+                        )
+                except Exception as e:
+                    logger.exception('TabPay webhook processing error', error=e)
+
+            _spawn_webhook_bg(_process_tabpay_bg())
+            return JSONResponse({'status': 'ok'}, status_code=status.HTTP_200_OK)
+
+        routes_registered = True
+
     # Donut webhook (Donut P2P)
     if settings.is_donut_configured():
 
@@ -1902,6 +2015,8 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
                     'donut_enabled': settings.is_donut_enabled(),
                     'lava_enabled': settings.is_lava_enabled(),
                     'cispay_enabled': settings.is_cispay_enabled(),
+                    'tabpay_enabled': settings.is_tabpay_enabled(),
+                    'paritypay_enabled': settings.is_paritypay_enabled(),
                 }
             )
 

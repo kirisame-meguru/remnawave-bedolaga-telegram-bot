@@ -41,9 +41,16 @@ from app.utils.pricing_utils import format_period_description
 from app.utils.promo_offer import (
     build_promo_offer_hint,
     build_test_access_hint,
+    get_user_active_promo_discount_percent,
 )
 from app.utils.rich_menu import try_edit_rich_main_menu
-from app.utils.telegram_html import html_to_telegram, info_page_faq_to_telegram, split_telegram_text
+from app.utils.subscription_time import local_days_until
+from app.utils.telegram_html import (
+    html_to_telegram,
+    info_page_faq_to_telegram,
+    split_telegram_text,
+    stored_html_to_telegram_pages,
+)
 from app.utils.timezone import format_local_datetime
 
 
@@ -304,7 +311,7 @@ async def show_service_rules(callback: types.CallbackQuery, db_user: User, db: A
 
     # Правила могут быть длиннее лимита Telegram (4096) — пагинация как у
     # политики конфиденциальности и оферты
-    pages = split_telegram_text(rules_text, max_length=3500) or ['']
+    pages = stored_html_to_telegram_pages(rules_text, max_length=3500) or ['']
     total_pages = len(pages)
     current_page = min(raw_page, total_pages)
 
@@ -669,7 +676,10 @@ async def show_faq_page(
         )
         return
 
-    content_pages = FaqService.split_content_into_pages(page.content)
+    # Через преобразователь: текст страницы редактируется как произвольный HTML,
+    # а Telegram знает восемь тегов. Один <p> из вставленной вёрстки — и вся
+    # страница перестаёт открываться с «Unsupported start tag».
+    content_pages = stored_html_to_telegram_pages(page.content, max_length=FaqService.MAX_PAGE_LENGTH)
 
     if not content_pages:
         await callback.answer(
@@ -803,7 +813,7 @@ async def show_privacy_policy(
         )
         return
 
-    pages = PrivacyPolicyService.split_content_into_pages(policy.content)
+    pages = stored_html_to_telegram_pages(policy.content, max_length=PrivacyPolicyService.MAX_PAGE_LENGTH)
 
     if not pages:
         await callback.answer(
@@ -927,7 +937,7 @@ async def show_public_offer(
         )
         return
 
-    pages = PublicOfferService.split_content_into_pages(offer.content)
+    pages = stored_html_to_telegram_pages(offer.content, max_length=PublicOfferService.MAX_PAGE_LENGTH)
 
     if not pages:
         await callback.answer(
@@ -1290,10 +1300,9 @@ def _get_subscription_status(user: User, texts, is_daily_tariff: bool = False) -
     actual_status = (subscription.actual_status or '').lower()
     end_date = getattr(subscription, 'end_date', None)
     end_date_text = format_local_datetime(end_date, '%d.%m.%Y') if end_date else None
-    days_left = 0
-
-    if subscription.end_date > current_time:
-        days_left = (subscription.end_date - current_time).days
+    # Календарные дни в зоне оператора: «завтра» = дата окончания завтра,
+    # а не «осталось меньше двух суток» (целая часть суток давала «завтра» при 1 д 23 ч).
+    days_left = local_days_until(subscription.end_date, current_time)
 
     if actual_status == 'pending':
         return texts.t('SUBSCRIPTION_NONE', '❌ Нет активной подписки')
@@ -1412,7 +1421,7 @@ async def _get_multi_tariff_status(user, texts, db: AsyncSession) -> tuple[str, 
         elif actual == 'limited':
             status_suffix = ' — лимит трафика'
         elif sub.end_date and sub.end_date > current_time:
-            days_left = (sub.end_date - current_time).days
+            days_left = local_days_until(sub.end_date, current_time)
             end_str = format_local_datetime(sub.end_date, '%d.%m.%Y')
             status_suffix = f' — до {end_str} ({days_left} дн.)'
         else:

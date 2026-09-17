@@ -20,6 +20,7 @@ from app.keyboards.inline import (
 from app.localization.texts import get_texts
 from app.states import BalanceStates
 from app.utils.decorators import error_handler
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -212,6 +213,20 @@ async def route_payment_by_method(
             await process_lava_payment_amount(message, db_user, db, amount_kopeks, state)
         return True
 
+    if payment_method in ('paritypay', 'paritypay_card', 'paritypay_sbp'):
+        from .paritypay import process_paritypay_payment_amount
+
+        async with AsyncSessionLocal() as db:
+            await process_paritypay_payment_amount(message, db_user, db, amount_kopeks, state)
+        return True
+
+    if payment_method in ('tabpay', 'tabpay_card', 'tabpay_sbp'):
+        from .tabpay import process_tabpay_payment_amount
+
+        async with AsyncSessionLocal() as db:
+            await process_tabpay_payment_amount(message, db_user, db, amount_kopeks, state)
+        return True
+
     if payment_method in ('cispay', 'cispay_card', 'cispay_sbp'):
         from .cispay import process_cispay_payment_amount
 
@@ -306,7 +321,7 @@ async def show_balance_history(callback: types.CallbackQuery, db_user: User, db:
 
         text += f'{emoji} {amount_text}\n'
         text += f'📝 {html.escape(transaction.description or "")}\n'
-        text += f'📅 {transaction.created_at.strftime("%d.%m.%Y %H:%M")}\n\n'
+        text += f'📅 {format_local_datetime(transaction.created_at, "%d.%m.%Y %H:%M")}\n\n'
 
     keyboard = []
     total_pages = (total_unique + TRANSACTIONS_PER_PAGE - 1) // TRANSACTIONS_PER_PAGE
@@ -621,6 +636,12 @@ async def handle_sbp_payment(callback: types.CallbackQuery, db: AsyncSession):
         await callback.answer('❌ Ошибка обработки платежа', show_alert=True)
 
 
+async def _reply_after_answer(callback: types.CallbackQuery, text: str) -> None:
+    """Нажатие уже подтверждено — второй answer() Telegram отвергнет, поэтому пишем сообщением."""
+    if isinstance(callback.message, types.Message):
+        await callback.message.answer(text)
+
+
 @error_handler
 async def handle_topup_amount_callback(
     callback: types.CallbackQuery,
@@ -638,8 +659,27 @@ async def handle_topup_amount_callback(
         await callback.answer('❌ Некорректная сумма', show_alert=True)
         return
 
+    # Сценарии, которым передаётся сам callback, отвечают на нажатие сами (у них свои алерты).
+    if method == 'tribute':
+        from .tribute import start_tribute_payment
+
+        await start_tribute_payment(callback, db_user)
+        return
+
+    if method == 'platega':
+        data = await state.get_data()
+        if (int(data.get('platega_method', 0)) if data else 0) <= 0:
+            from .platega import start_platega_payment
+
+            await state.update_data(platega_pending_amount=amount_kopeks)
+            await start_platega_payment(callback, db_user, state)
+            return
+
+    # Снимаем «часики» до похода к провайдеру: создание платежа может идти секунды, а Telegram
+    # ждёт ответ на нажатие недолго. Поздний answer() падал с «query is too old», собственный
+    # except считал это ошибкой пополнения и слал отчёт админам, хотя ссылка на оплату уже ушла.
+    await callback.answer()
     try:
-        # Особые случаи, требующие специальной логики
         if method.startswith('platega_m'):
             from app.database.database import AsyncSessionLocal
 
@@ -651,38 +691,26 @@ async def handle_topup_amount_callback(
             async with AsyncSessionLocal() as db:
                 await process_platega_payment_amount(callback.message, db_user, db, amount_kopeks, state)
         elif method == 'platega':
+            # Код способа уже лежит в состоянии — проверено выше.
             from app.database.database import AsyncSessionLocal
 
-            from .platega import process_platega_payment_amount, start_platega_payment
+            from .platega import process_platega_payment_amount
 
-            data = await state.get_data()
-            method_code = int(data.get('platega_method', 0)) if data else 0
-
-            if method_code > 0:
-                await state.set_state(BalanceStates.waiting_for_amount)
-                async with AsyncSessionLocal() as db:
-                    await process_platega_payment_amount(callback.message, db_user, db, amount_kopeks, state)
-            else:
-                await state.update_data(platega_pending_amount=amount_kopeks)
-                await start_platega_payment(callback, db_user, state)
-        elif method == 'tribute':
-            from .tribute import start_tribute_payment
-
-            await start_tribute_payment(callback, db_user)
-            return
+            await state.set_state(BalanceStates.waiting_for_amount)
+            async with AsyncSessionLocal() as db:
+                await process_platega_payment_amount(callback.message, db_user, db, amount_kopeks, state)
         # Стандартные методы через роутер
         else:
             await state.update_data(payment_method=method)
             await state.set_state(BalanceStates.waiting_for_amount)
             if not await route_payment_by_method(callback.message, db_user, amount_kopeks, state, method):
-                await callback.answer('❌ Неизвестный способ оплаты', show_alert=True)
-                return
+                await _reply_after_answer(callback, '❌ Неизвестный способ оплаты')
 
-        await callback.answer()
-
+    except TelegramBadRequest:
+        raise  # устаревший запрос и прочие ответы Telegram классифицирует @error_handler
     except Exception as error:
         logger.error('Ошибка быстрого пополнения', error=error)
-        await callback.answer('❌ Ошибка обработки запроса', show_alert=True)
+        await _reply_after_answer(callback, '❌ Ошибка обработки запроса')
 
 
 def register_balance_handlers(dp: Dispatcher):
@@ -871,6 +899,18 @@ def register_balance_handlers(dp: Dispatcher):
     dp.callback_query.register(start_cispay_topup, F.data == 'topup_cispay')
     dp.callback_query.register(start_cispay_card_topup, F.data == 'topup_cispay_card')
     dp.callback_query.register(start_cispay_sbp_topup, F.data == 'topup_cispay_sbp')
+
+    from .tabpay import start_tabpay_card_topup, start_tabpay_sbp_topup, start_tabpay_topup
+
+    dp.callback_query.register(start_tabpay_topup, F.data == 'topup_tabpay')
+    dp.callback_query.register(start_tabpay_card_topup, F.data == 'topup_tabpay_card')
+    dp.callback_query.register(start_tabpay_sbp_topup, F.data == 'topup_tabpay_sbp')
+
+    from .paritypay import start_paritypay_card_topup, start_paritypay_sbp_topup, start_paritypay_topup
+
+    dp.callback_query.register(start_paritypay_topup, F.data == 'topup_paritypay')
+    dp.callback_query.register(start_paritypay_card_topup, F.data == 'topup_paritypay_card')
+    dp.callback_query.register(start_paritypay_sbp_topup, F.data == 'topup_paritypay_sbp')
 
     from .mulenpay import check_mulenpay_payment_status
 

@@ -44,6 +44,7 @@ from ..schemas.partners import (
     ReferralsCountByPeriod,
     ReferrerDetailedStats,
     ReferrerSummary,
+    RewardsByLevel,
     TopReferralItem,
     TopReferralsResponse,
     TopReferrerItem,
@@ -141,7 +142,9 @@ async def list_referrers(
     if search:
         base_query = _apply_search_filter(base_query, search)
 
-    total_query = base_query.with_only_columns(func.count()).order_by(None)
+    # По колонке, а не func.count(): здесь FROM держится условием WHERE, но держаться
+    # ему положено самим счётчиком. См. tests/webapi/test_list_total_counts_rows.py.
+    total_query = base_query.with_only_columns(func.count(User.id)).order_by(None)
     total = await db.scalar(total_query) or 0
 
     result = await db.execute(base_query.order_by(User.created_at.desc()).offset(offset).limit(limit))
@@ -236,6 +239,7 @@ async def get_global_partner_stats(
     return GlobalPartnerStats(
         summary=GlobalPartnerSummary(**data['summary']),
         payouts=PayoutsByPeriod(**data['payouts']),
+        payouts_by_level=[RewardsByLevel(**row) for row in data.get('payouts_by_level') or []],
         new_referrals=NewReferralsByPeriod(**data['new_referrals']),
     )
 
@@ -292,6 +296,7 @@ async def get_referrer_detailed_stats(
         user_id=data['user_id'],
         summary=ReferrerSummary(**data['summary']),
         earnings=EarningsByPeriod(**data['earnings']),
+        earnings_by_level=[RewardsByLevel(**row) for row in data.get('earnings_by_level') or []],
         referrals_count=ReferralsCountByPeriod(**data['referrals_count']),
     )
 

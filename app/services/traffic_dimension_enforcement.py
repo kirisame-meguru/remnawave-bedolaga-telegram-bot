@@ -26,7 +26,7 @@ Grace сам владеет ``active_internal_squads`` и сверяет отв�
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from math import ceil
 from typing import Any
 
@@ -36,7 +36,7 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 
-class SquadTopology(str, Enum):
+class SquadTopology(StrEnum):
     """Как сквад соотносится с инбаундами измерения."""
 
     FREE = 'free'  # ни одного инбаунда измерения — снимать незачем
@@ -44,7 +44,7 @@ class SquadTopology(str, Enum):
     MIXED = 'mixed'  # и те, и другие — снятие отберёт оплаченный обычный доступ
 
 
-class BlockReason(str, Enum):
+class BlockReason(StrEnum):
     """Почему измерение сейчас ограничено."""
 
     QUOTA_EXHAUSTED = 'quota_exhausted'
@@ -56,7 +56,7 @@ class BlockReason(str, Enum):
     UNKNOWN_USAGE_HOLD = 'unknown_usage_hold'
 
 
-class EnforcementMode(str, Enum):
+class EnforcementMode(StrEnum):
     OBSERVE = 'observe'  # только считаем и логируем
     NOTIFY = 'notify'  # фиксируем исчерпание и уведомляем, доступ не трогаем
     ENFORCE = 'enforce'  # то же плюс снятие сквадов в панели
@@ -309,7 +309,7 @@ dimension_squad_policy = DimensionSquadPolicy()
 # ============================== Решение по подписке ==============================
 
 
-class EnforcementAction(str, Enum):
+class EnforcementAction(StrEnum):
     NONE = 'none'
     BLOCK = 'block'
     UNBLOCK = 'unblock'

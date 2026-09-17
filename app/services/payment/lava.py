@@ -1061,11 +1061,18 @@ class LavaPaymentMixin:
             # Лок строки подписки: продление — read-modify-write ``end_date``,
             # и конкурентное продление (ручное/другой коллбек) без него теряло
             # бы одно из двух.
-            from app.database.crud.subscription import _lock_subscription_row
+            from app.database.crud.subscription import _lock_subscription_row, reconcile_tariff_traffic_limit
 
             await _lock_subscription_row(db, subscription)
+            # Оверлей грейса, осевший в подписке, — не её срок: иначе новый период
+            # отсчитывался бы от конца грейса.
+            from app.services.grace_access_echo import undo_grace_overlay_echo
+
+            await undo_grace_overlay_echo(db, subscription)
 
             subscription.extend_subscription(record.charge_days)
+            # Условия тарифа на новый период: база тарифа + активные докупки.
+            await reconcile_tariff_traffic_limit(db, subscription)
 
             # Списание по локально ОТМЕНЁННОЙ записи = удалённая отмена не
             # прошла. Деньги взяты — продлеваем честно, но запись НЕ воскрешаем

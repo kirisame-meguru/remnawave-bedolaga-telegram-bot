@@ -272,7 +272,13 @@ class BlockedUsersService:
         return result
 
     async def delete_user_from_remnawave(self, remnawave_id: int) -> bool:
-        """Удаляет пользователя из панели Remnawave."""
+        """Удаляет пользователя из панели Remnawave.
+
+        ``REMNAWAVE_USER_DELETE_MODE`` здесь намеренно не спрашивается: это не
+        побочная уборка, а явно выбранное админом действие «удалить из Remnawave»
+        в разделе заблокированных — как ``force_panel_delete`` при полном удалении
+        пользователя. Кому нужна только деактивация, выбирает соседнее действие.
+        """
         if not remnawave_id:
             return False
 
@@ -405,6 +411,15 @@ class BlockedUsersService:
             user = user_result.scalar_one_or_none()
 
             if not user:
+                return False
+
+            from app.services.rbac_bootstrap_service import is_protected_from_blocking
+
+            if is_protected_from_blocking(user):
+                logger.info(
+                    'Пропуск пометки заблокированным: аккаунт админа из env',
+                    telegram_id=user.telegram_id or user.id,
+                )
                 return False
 
             user.status = UserStatus.BLOCKED.value

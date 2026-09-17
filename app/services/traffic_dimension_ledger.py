@@ -105,7 +105,7 @@ def window_start_for(
     elif name == 'MONTH_ROLLING':
         # Панель катит окно от собственного lastTrafficResetAt; если его не
         # передали, годовщина начала подписки — тот же день месяца.
-        start = last_reset_at if last_reset_at else _last_monthly_anniversary(subscription_start, today)
+        start = last_reset_at or _last_monthly_anniversary(subscription_start, today)
     else:
         # NO_RESET и всё незнакомое: считаем за всё время жизни подписки.
         start = subscription_start

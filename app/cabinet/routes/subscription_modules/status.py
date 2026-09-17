@@ -23,6 +23,8 @@ from app.database.crud.tariff import get_tariff_by_id
 from app.database.models import ServerSquad, User
 from app.services.remnawave_service import RemnaWaveService
 from app.services.system_settings_service import bot_configuration_service
+from app.utils.incy_crypt1 import wrap_incy_deep_link
+from app.utils.subscription_time import days_left_rounded_up
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from ...schemas.subscription import (
@@ -92,8 +94,7 @@ async def get_subscription(
     purchases = purchases_result.scalars().all()
 
     for purchase in purchases:
-        time_remaining = purchase.expires_at - now
-        days_remaining = max(0, int(time_remaining.total_seconds() / 86400))
+        days_remaining = days_left_rounded_up(purchase.expires_at, now)
         total_duration_seconds = (purchase.expires_at - purchase.created_at).total_seconds()
         elapsed_seconds = (now - purchase.created_at).total_seconds()
         progress_percent = min(
@@ -383,7 +384,7 @@ def _create_deep_link(
         except Exception as e:
             logger.warning('Failed to encode payload to base64', error=e)
 
-    return f'{scheme}{payload}'
+    return wrap_incy_deep_link(f'{scheme}{payload}', subscription_url)
 
 
 def _resolve_button_url(
@@ -411,7 +412,7 @@ def _resolve_button_url(
             result = re.sub(r'happ://crypt\d+/(?=\{\{HAPP_CRYPT[34]_LINK\}\})', '', result, flags=re.IGNORECASE)
         result = result.replace('{{HAPP_CRYPT3_LINK}}', subscription_crypto_link)
         result = result.replace('{{HAPP_CRYPT4_LINK}}', subscription_crypto_link)
-    return result
+    return wrap_incy_deep_link(result, subscription_url)
 
 
 @router.get('/app-config')

@@ -31,7 +31,7 @@ alembic branch.**
 
 ```python
 revision: str = 'xb0001'
-down_revision: Union[str, None] = '0098'          # the fork point, not upstream's tip
+down_revision: Union[str, None] = '0098'  # the fork point, not upstream's tip
 branch_labels: Union[str, Sequence[str], None] = ('xbedolaga',)
 ```
 
@@ -97,6 +97,21 @@ duplicate revision ids, `down_revision` pointing at nothing — is already
 covered branch-aware by `tests/test_alembic_revision_graph.py`. If a future
 sync re-adds it, delete it again; do not "fix" it by re-chaining the fork
 branch onto upstream's tip (see above for why that caused the outage).
+
+### v4.13.0 integration
+
+Upstream moved panel projection to `app/services/panel_sync/projection.py` and
+notification types to `app/services/notification_types.py`. Keep the fork's
+dimension protections in these shared modules, not in the old callers:
+
+- Panel pulls preserve squad entitlements temporarily removed by dimension enforcement.
+- Automatic pulls and webhooks do not import the panel's shield-inflated traffic limit
+  into the paid base quota. Explicit admin imports still accept panel limits.
+- Dimension notification types remain available for delivery and in the email editor.
+
+The `xb` branch remains independent; no existing migration is re-parented.
+Source-scanning style/architecture assertions are not retained as behavioral tests.
+The panel-sync suite checks observable expiry, quota, and entitlement behavior instead.
 
 ## Deploying `xb0003` (or anything that re-keys on `remnawave_id`)
 

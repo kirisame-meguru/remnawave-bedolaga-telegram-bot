@@ -2,9 +2,10 @@ import hmac
 import secrets
 import string
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import structlog
-from sqlalchemy import and_, case, exists, func, nullslast, or_, select, text
+from sqlalchemy import and_, case, exists, false, func, nullslast, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -29,7 +30,12 @@ from app.database.models import (
     UserStatus,
 )
 from app.utils.text_search import contains_conditions
+from app.utils.timezone import local_day_start
 from app.utils.validators import sanitize_telegram_name
+
+
+if TYPE_CHECKING:
+    from app.services.connected_accounts import ConnectedAccounts
 
 
 logger = structlog.get_logger(__name__)
@@ -41,7 +47,7 @@ _BIGINT_MAX = 9223372036854775807
 
 
 def _user_search_conditions(search: str) -> list:
-    """Build the OR-conditions for the admin user search box (id/name/username).
+    """Build the OR-conditions for the admin user search box (id/name/username/email).
 
     Always matches the text columns; matches telegram_id only when the term is an
     in-range BIGINT number. A digit string that overflows BIGINT (or a non-ASCII
@@ -53,7 +59,7 @@ def _user_search_conditions(search: str) -> list:
     «Позитив». Подробности — в app/utils/text_search.py.
     """
     conditions = contains_conditions(
-        (User.first_name, User.last_name, User.username),
+        (User.first_name, User.last_name, User.username, User.email),
         search,
     )
     if search.isdigit():
@@ -372,6 +378,28 @@ async def create_user_no_commit(
     return user
 
 
+async def emit_user_created_event(db: AsyncSession, user: User) -> None:
+    """Emit the best-effort post-commit user.created event for a persisted user."""
+    try:
+        from app.services.event_emitter import event_emitter
+
+        await event_emitter.emit(
+            'user.created',
+            {
+                'user_id': user.id,
+                'telegram_id': user.telegram_id,
+                'username': user.username,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'referral_code': user.referral_code,
+                'referred_by_id': user.referred_by_id,
+            },
+            db=db,
+        )
+    except Exception as error:
+        logger.warning('Failed to emit user.created event', error=error)
+
+
 def _violated_constraint(exc: IntegrityError) -> str:
     """Return the violated DB constraint name for an IntegrityError.
 
@@ -451,26 +479,7 @@ async def create_user(
                 '✅ Создан пользователь с реферальным кодом', telegram_id=telegram_id, referral_code=referral_code
             )
 
-            # Отправляем событие о создании пользователя
-            try:
-                from app.services.event_emitter import event_emitter
-
-                await event_emitter.emit(
-                    'user.created',
-                    {
-                        'user_id': user.id,
-                        'telegram_id': user.telegram_id,
-                        'username': user.username,
-                        'first_name': user.first_name,
-                        'last_name': user.last_name,
-                        'referral_code': user.referral_code,
-                        'referred_by_id': user.referred_by_id,
-                    },
-                    db=db,
-                )
-            except Exception as error:
-                logger.warning('Failed to emit user.created event', error=error)
-
+            await emit_user_created_event(db, user)
             return user
 
         except IntegrityError as exc:
@@ -941,6 +950,230 @@ async def cleanup_expired_promo_offer_discounts(db: AsyncSession) -> int:
     return len(users)
 
 
+#: Статусы, при которых подписка ещё даёт доступ (с непрошедшей датой окончания).
+LIVE_SUBSCRIPTION_STATUSES = (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value)
+
+#: Статусы «доступа больше нет».
+#:
+#: В мультитарифе их нельзя проверять по одной подписке: у человека с тремя живыми
+#: тарифами одна старая истёкшая строка не делает его отвалившимся. Такие выборки
+#: ищут людей, у которых не осталось ни одной живой подписки.
+GONE_SUBSCRIPTION_STATUSES = frozenset(
+    {
+        SubscriptionStatus.EXPIRED.value,
+        SubscriptionStatus.DISABLED.value,
+        SubscriptionStatus.LIMITED.value,
+    }
+)
+
+
+def _has_live_subscription(now: datetime):
+    """Есть ли у пользователя хоть одна подписка, которая сейчас даёт доступ."""
+    return exists(
+        select(Subscription.id)
+        .where(
+            Subscription.user_id == User.id,
+            Subscription.status.in_(LIVE_SUBSCRIPTION_STATUSES),
+            Subscription.end_date > now,
+        )
+        .correlate(User)
+    )
+
+
+def _users_list_conditions(
+    *,
+    status: UserStatus | None = None,
+    search: str | None = None,
+    email: str | None = None,
+    subscription_status: str | None = None,
+    tariff_ids: list[int] | None = None,
+    promo_group_id: int | None = None,
+    campaign_id: int | None = None,
+    partner_id: int | None = None,
+    expires_within_days: int | None = None,
+    active_within_minutes: int | None = None,
+    has_restrictions: bool | None = None,
+    has_subscription: bool | None = None,
+    purchase_count: int | None = None,
+    traffic_used_percent_min: int | None = None,
+    connected: 'ConnectedAccounts | None' = None,
+    in_grace: bool | None = None,
+) -> list:
+    """Условия WHERE списка пользователей админки — одни для списка и для счётчика.
+
+    Раньше get_users_list и get_users_count повторяли эти ветки руками; новая ветка,
+    добавленная только в одну из них, давала «показано 12 из 40» при 12 найденных.
+    """
+    conditions: list = []
+    now = datetime.now(UTC)
+
+    if status:
+        conditions.append(User.status == status.value)
+
+    if subscription_status or tariff_ids:
+        sub_conditions = []
+        if subscription_status:
+            sub_conditions.append(Subscription.status == subscription_status)
+        if tariff_ids:
+            sub_conditions.append(Subscription.tariff_id.in_(tariff_ids))
+        sub_query = (
+            select(Subscription.user_id).where(and_(*sub_conditions)).distinct().correlate(None).scalar_subquery()
+        )
+        conditions.append(User.id.in_(sub_query))
+
+    if subscription_status in GONE_SUBSCRIPTION_STATUSES:
+        # «Истекшие», «Отключена», «Лимит» — это «человек остался без доступа».
+        # Одной такой строки мало: у владельца нескольких тарифов она может лежать
+        # рядом с живыми. См. tests/cabinet/test_admin_users_multi_tariff_and_grace.py.
+        conditions.append(~_has_live_subscription(now))
+
+    if promo_group_id:
+        # Юзер считается членом группы если она в legacy `user.promo_group_id` ИЛИ
+        # в M2M `user_promo_groups`. Без OR-условия админский фильтр пропускал юзеров
+        # с группой только в M2M (см. analogue issue #422 для payment methods).
+        conditions.append(
+            or_(
+                User.promo_group_id == promo_group_id,
+                User.id.in_(
+                    select(UserPromoGroup.user_id)
+                    .where(UserPromoGroup.promo_group_id == promo_group_id)
+                    .correlate(None)
+                ),
+            )
+        )
+
+    if campaign_id:
+        conditions.append(
+            exists(
+                select(AdvertisingCampaignRegistration.id)
+                .where(
+                    AdvertisingCampaignRegistration.user_id == User.id,
+                    AdvertisingCampaignRegistration.campaign_id == campaign_id,
+                )
+                .correlate(User)
+            )
+        )
+
+    if partner_id:
+        conditions.append(
+            exists(
+                select(AdvertisingCampaignRegistration.id)
+                .join(AdvertisingCampaign, AdvertisingCampaign.id == AdvertisingCampaignRegistration.campaign_id)
+                .where(
+                    AdvertisingCampaignRegistration.user_id == User.id,
+                    AdvertisingCampaign.partner_user_id == partner_id,
+                )
+                .correlate(User)
+            )
+        )
+
+    if search:
+        conditions.append(or_(*_user_search_conditions(search)))
+
+    if email:
+        conditions.append(User.email.ilike(f'%{email}%'))
+
+    if expires_within_days is not None:
+        # «Истекают за N дней»: живая подписка с концом в ближайшие N дней. Суточные
+        # тарифы исключены так же, как в сортировке по окончанию: у активной суточной
+        # конец всегда через сутки, и она навсегда заняла бы весь сегмент.
+        conditions.append(
+            exists(
+                select(Subscription.id)
+                .outerjoin(Tariff, Subscription.tariff_id == Tariff.id)
+                .where(
+                    Subscription.user_id == User.id,
+                    Subscription.status == SubscriptionStatus.ACTIVE.value,
+                    Subscription.end_date >= now,
+                    Subscription.end_date <= now + timedelta(days=expires_within_days),
+                    ~and_(Tariff.is_daily.is_(True), Subscription.is_daily_paused.is_(False)),
+                )
+                .correlate(User)
+            )
+        )
+
+    if active_within_minutes is not None:
+        conditions.append(User.last_activity >= now - timedelta(minutes=active_within_minutes))
+
+    if has_restrictions is not None:
+        restricted = or_(User.restriction_topup.is_(True), User.restriction_subscription.is_(True))
+        conditions.append(restricted if has_restrictions else ~restricted)
+
+    if has_subscription is not None:
+        any_subscription = exists(select(Subscription.id).where(Subscription.user_id == User.id).correlate(User))
+        conditions.append(any_subscription if has_subscription else ~any_subscription)
+
+    if in_grace is not None:
+        # «В грейсе» — открытый временный доступ: тот же признак, по которому строка
+        # получает «временно до …». Закрытый грейс держит старую дату оверлея, но
+        # доступа у человека уже нет — он не в сегменте.
+        on_grace = exists(
+            select(Subscription.id)
+            .where(Subscription.user_id == User.id, Subscription.grace_session_open.is_(True))
+            .correlate(User)
+        )
+        conditions.append(on_grace if in_grace else ~on_grace)
+
+    if purchase_count == 0:
+        # Покупка — ровно то, что считает статистика трат: завершённая оплата подписки.
+        conditions.append(
+            ~exists(
+                select(Transaction.id)
+                .where(
+                    Transaction.user_id == User.id,
+                    Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+                    Transaction.is_completed.is_(True),
+                )
+                .correlate(User)
+            )
+        )
+
+    if traffic_used_percent_min is not None:
+        # «Трафик на исходе»: живая подписка с лимитом, израсходованным от N %. Исчерпанная
+        # (LIMITED) тоже здесь — ей трафик нужен больше всех; безлимит (0) не считается.
+        threshold = traffic_used_percent_min / 100
+        conditions.append(
+            exists(
+                select(Subscription.id)
+                .where(
+                    Subscription.user_id == User.id,
+                    Subscription.status.in_(
+                        (
+                            SubscriptionStatus.ACTIVE.value,
+                            SubscriptionStatus.TRIAL.value,
+                            SubscriptionStatus.LIMITED.value,
+                        )
+                    ),
+                    Subscription.traffic_limit_gb > 0,
+                    Subscription.traffic_used_gb >= Subscription.traffic_limit_gb * threshold,
+                )
+                .correlate(User)
+            )
+        )
+
+    if connected is not None:
+        # «Онлайн» = подключён к VPN сейчас (список панели, см. app/services/panel_online.py).
+        # Ключи — как у ConnectedAccounts.has_user: id панели у пользователя, у подписки, Telegram ID.
+        keys = []
+        if connected.panel_ids:
+            keys.append(User.remnawave_id.in_(connected.panel_ids))
+            keys.append(
+                exists(
+                    select(Subscription.id)
+                    .where(
+                        Subscription.user_id == User.id,
+                        Subscription.remnawave_id.in_(connected.panel_ids),
+                    )
+                    .correlate(User)
+                )
+            )
+        if connected.telegram_ids:
+            keys.append(User.telegram_id.in_(connected.telegram_ids))
+        conditions.append(or_(*keys) if keys else false())
+
+    return conditions
+
+
 async def get_users_list(
     db: AsyncSession,
     offset: int = 0,
@@ -953,70 +1186,56 @@ async def get_users_list(
     promo_group_id: int | None = None,
     campaign_id: int | None = None,
     partner_id: int | None = None,
+    expires_within_days: int | None = None,
+    active_within_minutes: int | None = None,
+    has_restrictions: bool | None = None,
+    has_subscription: bool | None = None,
+    purchase_count: int | None = None,
+    traffic_used_percent_min: int | None = None,
+    connected: 'ConnectedAccounts | None' = None,
+    in_grace: bool | None = None,
     order_by_balance: bool = False,
     order_by_traffic: bool = False,
     order_by_last_activity: bool = False,
     order_by_total_spent: bool = False,
     order_by_purchase_count: bool = False,
     order_by_subscription_end: bool = False,
+    order_by_grace: bool = False,
+    sort_descending: bool | None = None,
 ) -> list[User]:
+    """Страница списка пользователей админки.
+
+    ``sort_descending`` — направление выбранной сортировки; ``None`` оставляет
+    привычное: окончание подписки и грейса — сначала скорые, остальное — сначала
+    больше/новее. Люди без значения ключа (нет активности, нет подходящей подписки,
+    нет открытого грейса) внизу в обе стороны, при равных ключах — сначала новые.
+    """
     query = select(User).options(
         selectinload(User.subscriptions).selectinload(Subscription.tariff),
         selectinload(User.promo_group),
         selectinload(User.referrer),
     )
 
-    if status:
-        query = query.where(User.status == status.value)
-
-    # Subscription-level filters via subquery
-    if subscription_status or tariff_ids:
-        sub_conditions = []
-        if subscription_status:
-            sub_conditions.append(Subscription.status == subscription_status)
-        if tariff_ids:
-            sub_conditions.append(Subscription.tariff_id.in_(tariff_ids))
-        sub_query = select(Subscription.user_id).where(and_(*sub_conditions)).distinct().scalar_subquery()
-        query = query.where(User.id.in_(sub_query))
-
-    if promo_group_id:
-        # Юзер считается членом группы если она в legacy `user.promo_group_id` ИЛИ
-        # в M2M `user_promo_groups`. Без OR-условия админский фильтр пропускал юзеров
-        # с группой только в M2M (см. analogue issue #422 для payment methods).
-        query = query.where(
-            or_(
-                User.promo_group_id == promo_group_id,
-                User.id.in_(select(UserPromoGroup.user_id).where(UserPromoGroup.promo_group_id == promo_group_id)),
-            )
+    query = query.where(
+        *_users_list_conditions(
+            status=status,
+            search=search,
+            email=email,
+            subscription_status=subscription_status,
+            tariff_ids=tariff_ids,
+            promo_group_id=promo_group_id,
+            campaign_id=campaign_id,
+            partner_id=partner_id,
+            expires_within_days=expires_within_days,
+            active_within_minutes=active_within_minutes,
+            has_restrictions=has_restrictions,
+            has_subscription=has_subscription,
+            purchase_count=purchase_count,
+            traffic_used_percent_min=traffic_used_percent_min,
+            connected=connected,
+            in_grace=in_grace,
         )
-
-    if campaign_id:
-        query = query.where(
-            exists(
-                select(AdvertisingCampaignRegistration.id).where(
-                    AdvertisingCampaignRegistration.user_id == User.id,
-                    AdvertisingCampaignRegistration.campaign_id == campaign_id,
-                )
-            )
-        )
-
-    if partner_id:
-        query = query.where(
-            exists(
-                select(AdvertisingCampaignRegistration.id)
-                .join(AdvertisingCampaign, AdvertisingCampaign.id == AdvertisingCampaignRegistration.campaign_id)
-                .where(
-                    AdvertisingCampaignRegistration.user_id == User.id,
-                    AdvertisingCampaign.partner_user_id == partner_id,
-                )
-            )
-        )
-
-    if search:
-        query = query.where(or_(*_user_search_conditions(search)))
-
-    if email:
-        query = query.where(User.email.ilike(f'%{email}%'))
+    )
 
     sort_flags = [
         order_by_balance,
@@ -1025,10 +1244,11 @@ async def get_users_list(
         order_by_total_spent,
         order_by_purchase_count,
         order_by_subscription_end,
+        order_by_grace,
     ]
     if sum(int(flag) for flag in sort_flags) > 1:
         logger.debug(
-            'Выбрано несколько сортировок пользователей — применяется приоритет: трафик > траты > покупки > баланс > активность > окончание подписки'
+            'Выбрано несколько сортировок пользователей — применяется приоритет: трафик > траты > покупки > баланс > активность > окончание подписки > грейс'
         )
 
     transactions_stats = None
@@ -1044,19 +1264,26 @@ async def get_users_list(
         query = query.outerjoin(transactions_stats, transactions_stats.c.user_id == User.id)
 
     if order_by_traffic:
-        traffic_sort = func.coalesce(Subscription.traffic_used_gb, 0.0)
-        query = query.outerjoin(Subscription, Subscription.user_id == User.id)
-        query = query.order_by(traffic_sort.desc(), User.created_at.desc())
+        # Подзапросом, а не JOIN подписок: JOIN давал по строке на каждую подписку
+        # мультитарифа (страница короче запрошенной, «показано N из M» врало) и
+        # ломал выборки — их условия «есть такая подписка у этого человека»
+        # SQLAlchemy считала целиком связанными с внешним запросом и выкидывала
+        # из подзапроса все таблицы (см. tests/crud/test_users_list_filter_sort_matrix.py).
+        most_traffic = (
+            select(func.max(Subscription.traffic_used_gb))
+            .where(Subscription.user_id == User.id)
+            .correlate(User)
+            .scalar_subquery()
+        )
+        sort_key, natural_descending = func.coalesce(most_traffic, 0.0), True
     elif order_by_total_spent:
-        order_column = func.coalesce(transactions_stats.c.total_spent, 0)
-        query = query.order_by(order_column.desc(), User.created_at.desc())
+        sort_key, natural_descending = func.coalesce(transactions_stats.c.total_spent, 0), True
     elif order_by_purchase_count:
-        order_column = func.coalesce(transactions_stats.c.purchase_count, 0)
-        query = query.order_by(order_column.desc(), User.created_at.desc())
+        sort_key, natural_descending = func.coalesce(transactions_stats.c.purchase_count, 0), True
     elif order_by_balance:
-        query = query.order_by(User.balance_kopeks.desc(), User.created_at.desc())
+        sort_key, natural_descending = User.balance_kopeks, True
     elif order_by_last_activity:
-        query = query.order_by(nullslast(User.last_activity.desc()), User.created_at.desc())
+        sort_key, natural_descending = User.last_activity, True
     elif order_by_subscription_end:
         # MIN(end_date) среди подписок пользователя; без outerjoin — иначе дубли
         # строк при нескольких подписках (мультитариф).
@@ -1085,11 +1312,28 @@ async def get_users_list(
             .select_from(Subscription)
             .outerjoin(Tariff, Subscription.tariff_id == Tariff.id)
             .where(*soonest_end_conditions)
+            .correlate(User)
             .scalar_subquery()
         )
-        query = query.order_by(nullslast(soonest_end.asc()), User.created_at.desc())
+        sort_key, natural_descending = soonest_end, False
+    elif order_by_grace:
+        # MIN(grace_overlay_expire_at) среди подписок с ОТКРЫТЫМ грейсом — та же дата,
+        # что кабинет показывает строкой «временно до …» (``_grace_until`` в admin_users).
+        # У закрытого грейса дата оверлея остаётся в строке, но грейса у человека
+        # нет — ключ пустой, и такие люди внизу в обе стороны.
+        soonest_grace = (
+            select(func.min(Subscription.grace_overlay_expire_at))
+            .where(Subscription.user_id == User.id, Subscription.grace_session_open.is_(True))
+            .correlate(User)
+            .scalar_subquery()
+        )
+        sort_key, natural_descending = soonest_grace, False
     else:
-        query = query.order_by(User.created_at.desc())
+        sort_key, natural_descending = User.created_at, True
+
+    descending = natural_descending if sort_descending is None else sort_descending
+    ordered_key = nullslast(sort_key.desc() if descending else sort_key.asc())
+    query = query.order_by(ordered_key, User.created_at.desc(), User.id.desc())
 
     query = query.offset(offset).limit(limit)
 
@@ -1115,59 +1359,35 @@ async def get_users_count(
     promo_group_id: int | None = None,
     campaign_id: int | None = None,
     partner_id: int | None = None,
+    expires_within_days: int | None = None,
+    active_within_minutes: int | None = None,
+    has_restrictions: bool | None = None,
+    has_subscription: bool | None = None,
+    purchase_count: int | None = None,
+    traffic_used_percent_min: int | None = None,
+    connected: 'ConnectedAccounts | None' = None,
+    in_grace: bool | None = None,
 ) -> int:
-    query = select(func.count(User.id))
-
-    if status:
-        query = query.where(User.status == status.value)
-
-    if subscription_status or tariff_ids:
-        sub_conditions = []
-        if subscription_status:
-            sub_conditions.append(Subscription.status == subscription_status)
-        if tariff_ids:
-            sub_conditions.append(Subscription.tariff_id.in_(tariff_ids))
-        sub_query = select(Subscription.user_id).where(and_(*sub_conditions)).distinct().scalar_subquery()
-        query = query.where(User.id.in_(sub_query))
-
-    if promo_group_id:
-        # Юзер считается членом группы если она в legacy `user.promo_group_id` ИЛИ
-        # в M2M `user_promo_groups`. Без OR-условия админский фильтр пропускал юзеров
-        # с группой только в M2M (см. analogue issue #422 для payment methods).
-        query = query.where(
-            or_(
-                User.promo_group_id == promo_group_id,
-                User.id.in_(select(UserPromoGroup.user_id).where(UserPromoGroup.promo_group_id == promo_group_id)),
-            )
+    query = select(func.count(User.id)).where(
+        *_users_list_conditions(
+            status=status,
+            search=search,
+            email=email,
+            subscription_status=subscription_status,
+            tariff_ids=tariff_ids,
+            promo_group_id=promo_group_id,
+            campaign_id=campaign_id,
+            partner_id=partner_id,
+            expires_within_days=expires_within_days,
+            active_within_minutes=active_within_minutes,
+            has_restrictions=has_restrictions,
+            has_subscription=has_subscription,
+            purchase_count=purchase_count,
+            traffic_used_percent_min=traffic_used_percent_min,
+            connected=connected,
+            in_grace=in_grace,
         )
-
-    if campaign_id:
-        query = query.where(
-            exists(
-                select(AdvertisingCampaignRegistration.id).where(
-                    AdvertisingCampaignRegistration.user_id == User.id,
-                    AdvertisingCampaignRegistration.campaign_id == campaign_id,
-                )
-            )
-        )
-
-    if partner_id:
-        query = query.where(
-            exists(
-                select(AdvertisingCampaignRegistration.id)
-                .join(AdvertisingCampaign, AdvertisingCampaign.id == AdvertisingCampaignRegistration.campaign_id)
-                .where(
-                    AdvertisingCampaignRegistration.user_id == User.id,
-                    AdvertisingCampaign.partner_user_id == partner_id,
-                )
-            )
-        )
-
-    if search:
-        query = query.where(or_(*_user_search_conditions(search)))
-
-    if email:
-        query = query.where(User.email.ilike(f'%{email}%'))
+    )
 
     result = await db.execute(query)
     return result.scalar()
@@ -1346,7 +1566,15 @@ async def get_users_statistics(db: AsyncSession) -> dict:
     active_result = await db.execute(select(func.count(User.id)).where(User.status == UserStatus.ACTIVE.value))
     active_users = active_result.scalar()
 
-    today = datetime.now(UTC).date()
+    # «Заблокировано» — только статус «заблокирован». Раньше считалось «всего минус активные»,
+    # и в карточку кабинета попадали удалённые, которых в разы больше, чем заблокированных:
+    # сводка показывала 1097, а список с фильтром «Заблокированные» — одну страницу.
+    blocked_result = await db.execute(select(func.count(User.id)).where(User.status == UserStatus.BLOCKED.value))
+    blocked_users = blocked_result.scalar()
+    deleted_result = await db.execute(select(func.count(User.id)).where(User.status == UserStatus.DELETED.value))
+    deleted_users = deleted_result.scalar()
+
+    today = local_day_start()
     today_result = await db.execute(
         select(func.count(User.id)).where(and_(User.created_at >= today, User.status == UserStatus.ACTIVE.value))
     )
@@ -1367,7 +1595,8 @@ async def get_users_statistics(db: AsyncSession) -> dict:
     return {
         'total_users': total_users,
         'active_users': active_users,
-        'blocked_users': total_users - active_users,
+        'blocked_users': blocked_users,
+        'deleted_users': deleted_users,
         'new_today': new_today,
         'new_week': new_week,
         'new_month': new_month,
@@ -1485,6 +1714,44 @@ async def get_user_by_email(db: AsyncSession, email: str) -> User | None:
     return result.scalar_one_or_none()
 
 
+async def get_user_by_email_alias(
+    db: AsyncSession,
+    email: str,
+    *,
+    exclude_user_id: int | None = None,
+) -> User | None:
+    """Найти пользователя, чей адрес ведёт в тот же ящик, что и ``email``.
+
+    ``user+1@gmail.com`` и ``u.ser@gmail.com`` — разные строки, но один ящик:
+    подтверждение адреса проходит штатно, письма приходят тому же человеку.
+    Сравнение по одному лишь регистру этого не видит, и на каждом таком алиасе
+    заводится отдельный аккаунт со своей пробной подпиской.
+
+    Совпадение считается по каноническому виду, поэтому точный дубль сюда тоже
+    попадает — вызывающий код проверяет его отдельно и раньше. Для доменов без
+    алиасов (корпоративных и незнакомых) запрос не выполняется вовсе.
+
+    ``exclude_user_id`` обязателен там, где свой собственный адрес занятым не
+    считается: фильтровать после выборки нельзя — ``LIMIT 1`` вернул бы своего
+    же юзера и скрыл чужой аккаунт на том же ящике.
+    """
+    from app.utils.email_alias import alias_match_clause
+
+    if not email or not email.strip():
+        return None
+
+    clause = alias_match_clause(User.email, email)
+    if clause is None:
+        return None
+
+    query = select(User).where(User.email.isnot(None), clause)
+    if exclude_user_id is not None:
+        query = query.where(User.id != exclude_user_id)
+
+    result = await db.execute(query.limit(1))
+    return result.scalar_one_or_none()
+
+
 async def is_email_taken(db: AsyncSession, email: str, exclude_user_id: int | None = None) -> bool:
     """
     Check if email is already taken by another user.
@@ -1504,7 +1771,12 @@ async def is_email_taken(db: AsyncSession, email: str, exclude_user_id: int | No
     if exclude_user_id:
         query = query.where(User.id != exclude_user_id)
     result = await db.execute(query)
-    return result.scalar_one_or_none() is not None
+    if result.scalar_one_or_none() is not None:
+        return True
+
+    # Другая запись того же ящика занимает его не меньше, чем точное совпадение
+    alias_owner = await get_user_by_email_alias(db, email, exclude_user_id=exclude_user_id)
+    return alias_owner is not None
 
 
 async def set_email_change_pending(
@@ -1649,13 +1921,43 @@ async def set_user_oauth_provider_id(db: AsyncSession, user: User, provider: str
     logger.info('OAuth provider linked to user', provider=provider, provider_id=provider_id, user_id=user.id)
 
 
+def provider_attested_email(user: User, provider: str) -> str | None:
+    """Email, который держится только на этом провайдере: получен от него (backfill при
+    привязке или создание через него) и не стал самостоятельным логином — пароля нет.
+    Такой email уходит вместе с отвязкой провайдера; кабинет предупреждает об этом заранее.
+    """
+    if user.email and user.email_verification_source == f'oauth_{provider}' and not user.password_hash:
+        return str(user.email)
+    return None
+
+
 async def clear_user_oauth_provider_id(db: AsyncSession, user: User, provider: str) -> None:
-    """Unlink an OAuth provider from an existing user (set column to None)."""
+    """Unlink an OAuth provider from an existing user (set column to None).
+
+    Email, который аккаунт получил только от этого провайдера (backfill при привязке
+    или создание через него), уходит вместе с провайдером. Иначе он «висит» без
+    способа его убрать, а следующий вход через провайдера находит аккаунт по этому
+    email и привязывает провайдера обратно — цикл (жалоба 2026-09-14). Если человек
+    поставил пароль, email стал самостоятельным способом входа и остаётся.
+    """
     column_name = OAUTH_PROVIDER_COLUMNS.get(provider)
     if not column_name:
         logger.warning('Unknown OAuth provider in clear', provider=provider, user_id=user.id)
         return
     setattr(user, column_name, None)
+    if provider_attested_email(user, provider):
+        user.email = None
+        user.email_verified = False
+        user.email_verified_at = None
+        user.email_verification_source = None
+        user.email_verification_token = None
+        user.email_verification_expires = None
+        user.email_change_new = None
+        user.email_change_code = None
+        user.email_change_expires = None
+        user.password_reset_token = None
+        user.password_reset_expires = None
+        logger.info('Forgot the email attested only by the unlinked provider', provider=provider, user_id=user.id)
     user.updated_at = datetime.now(UTC)
     logger.info('Unlinked OAuth provider from user', provider=provider, user_id=user.id)
 

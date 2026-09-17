@@ -26,10 +26,12 @@ from app.database.models import Tariff, Transaction, TransactionType, User
 from app.localization.texts import Texts, get_texts
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.subscription_service import SubscriptionService
+from app.services.tariff_switch_policy import remaining_days_for_switch, should_reset_used_traffic
 from app.services.user_cart_service import user_cart_service
 from app.utils.decorators import error_handler
 from app.utils.formatting import format_period, format_price_kopeks, format_traffic
 from app.utils.promo_offer import get_user_active_promo_discount_percent
+from app.utils.subscription_time import local_days_until
 
 
 logger = structlog.get_logger(__name__)
@@ -235,15 +237,36 @@ def get_tariffs_keyboard(
         purchased_tariff_ids = set()
     buttons = []
 
+    badge = texts.t('TARIFF_BEST_VALUE_BADGE', '⭐ выгодно')
     for tariff in tariffs:
         if tariff.id in purchased_tariff_ids:
-            buttons.append([InlineKeyboardButton(text=f'✅ {tariff.name}', callback_data=f'tariff_select:{tariff.id}')])
+            # Уже купленный тариф важнее подсказки: галочка отвечает на вопрос
+            # «а этот у меня есть?», отметка выгоды тут уже ничего не решает.
+            title = f'✅ {tariff.name}'
+        elif getattr(tariff, 'is_highlighted', False):
+            title = f'{badge} · {tariff.name}'
         else:
-            buttons.append([InlineKeyboardButton(text=tariff.name, callback_data=f'tariff_select:{tariff.id}')])
+            title = tariff.name
+        buttons.append([InlineKeyboardButton(text=title, callback_data=f'tariff_select:{tariff.id}')])
 
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _period_button_text(tariff: Tariff, period: int, price_text: str, texts) -> str:
+    """Единый текст кнопки периода: подпись, цена и отметка выгодного периода.
+
+    Собирался в четырёх клавиатурах подряд одинаковой строкой — отметку пришлось
+    бы добавлять четыре раза и держать одинаковой на глаз.
+
+    В инлайн-кнопку рамку не нарисовать, поэтому выделение — подпись в начале
+    текста: она видна до цены и не теряется среди остальных строк.
+    """
+    label = f'{format_period(period)} — {price_text}'
+    if tariff.highlight_period_days is not None and int(tariff.highlight_period_days) == period:
+        return f'{texts.t("TARIFF_PERIOD_BEST_VALUE_BADGE", "⭐ выгодно")} · {label}'
+    return label
 
 
 def get_tariff_periods_keyboard(
@@ -272,7 +295,7 @@ def get_tariff_periods_keyboard(
         else:
             price_text = format_price_kopeks(price)
 
-        button_text = f'{format_period(period)} — {price_text}'
+        button_text = _period_button_text(tariff, period, price_text, texts)
         buttons.append([InlineKeyboardButton(text=button_text, callback_data=f'tariff_period:{tariff.id}:{period}')])
 
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=back_callback)])
@@ -306,7 +329,7 @@ def get_tariff_periods_keyboard_with_traffic(
         else:
             price_text = format_price_kopeks(price)
 
-        button_text = f'{format_period(period)} — {price_text}'
+        button_text = _period_button_text(tariff, period, price_text, texts)
         # Используем другой callback для перехода к настройке трафика
         buttons.append(
             [InlineKeyboardButton(text=button_text, callback_data=f'tariff_period_traffic:{tariff.id}:{period}')]
@@ -905,7 +928,7 @@ async def _proceed_with_selected_tariff(
         _active = await get_active_subscriptions_by_user_id(db, db_user.id)
         _existing = next((s for s in _active if s.tariff_id == tariff_id and not s.is_trial), None)
         if _existing:
-            days_left = max(0, (_existing.end_date - datetime.now(UTC)).days) if _existing.end_date else 0
+            days_left = local_days_until(_existing.end_date) if _existing.end_date else 0
             await callback.answer(
                 texts.t(
                     'TARIFF_PURCHASE_ALREADY_ACTIVE',
@@ -2578,7 +2601,7 @@ def get_tariff_extend_keyboard(
         else:
             price_text = format_price_kopeks(price)
 
-        button_text = f'{format_period(period)} — {price_text}'
+        button_text = _period_button_text(tariff, period, price_text, texts)
         # subscription_id ОБЯЗАН быть первым сегментом: иначе резолвер по callback
         # принял бы хвостовой {period} за subscription_id (см. issue #3012 —
         # период совпадал с id чужой подписки и продлевалась не та подписка).
@@ -2656,7 +2679,7 @@ async def show_tariff_extend(
                         tariff_name = texts.t('TARIFF_PURCHASE_SUBSCRIPTION_FALLBACK', 'Подписка #{id}').format(
                             id=sub.id
                         )
-                    days_left = max(0, (sub.end_date - datetime.now(UTC)).days) if sub.end_date else 0
+                    days_left = local_days_until(sub.end_date) if sub.end_date else 0
                     keyboard.append(
                         [
                             InlineKeyboardButton(
@@ -3304,7 +3327,7 @@ def get_tariff_switch_periods_keyboard(
         else:
             price_text = format_price_kopeks(price)
 
-        button_text = f'{format_period(period)} — {price_text}'
+        button_text = _period_button_text(tariff, period, price_text, texts)
         buttons.append([InlineKeyboardButton(text=button_text, callback_data=f'tariff_sw_period:{tariff.id}:{period}')])
 
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data='tariff_switch')])
@@ -3420,7 +3443,7 @@ async def show_tariff_switch_list(
     # Фильтруем по разрешённым направлениям (upgrade/downgrade)
     current_tariff = await get_tariff_by_id(db, current_tariff_id) if current_tariff_id else None
     if current_tariff:
-        remaining_days = max(0, (subscription.end_date - datetime.now(UTC)).days) if subscription.end_date else 0
+        remaining_days = remaining_days_for_switch(subscription.end_date)
         available_tariffs = _filter_tariffs_by_switch_direction(
             available_tariffs, current_tariff, remaining_days, db_user
         )
@@ -3495,11 +3518,7 @@ async def select_tariff_switch(
     if current_subscription_sw and current_subscription_sw.tariff_id:
         cur_tariff_sw = await get_tariff_by_id(db, current_subscription_sw.tariff_id)
         if cur_tariff_sw:
-            rem_days = (
-                max(0, (current_subscription_sw.end_date - datetime.now(UTC)).days)
-                if current_subscription_sw.end_date
-                else 0
-            )
+            rem_days = remaining_days_for_switch(current_subscription_sw.end_date)
             _, is_up = _calculate_instant_switch_cost(cur_tariff_sw, tariff, rem_days, db_user)
             if is_up and not settings.TARIFF_SWITCH_UPGRADE_ENABLED:
                 await callback.answer(
@@ -3535,13 +3554,14 @@ async def select_tariff_switch(
         current_subscription, _sw_sub_id = await _resolve_switch_subscription(callback, db_user, db, state)
         days_warning = ''
         if current_subscription and current_subscription.end_date:
-            remaining = current_subscription.end_date - datetime.now(UTC)
-            remaining_days = max(0, remaining.days)
-            if remaining_days > 1:
+            # Предупреждение показывает ПОЛНЫЕ оставшиеся дни, а не расчётный остаток:
+            # «осталось 0 дн.» в тексте про потерю дней смысла не имеет.
+            whole_days_left = max(0, (current_subscription.end_date - datetime.now(UTC)).days)
+            if whole_days_left > 1:
                 days_warning = '\n\n' + texts.t(
                     'DAILY_SWITCH_WARNING',
                     '⚠️ <b>Внимание!</b> У вас осталось {days} дн. подписки.\nПри смене на суточный тариф они будут утеряны!',
-                ).format(days=remaining_days)
+                ).format(days=whole_days_left)
 
         if user_balance >= daily_price:
             await callback.message.edit_text(
@@ -3792,7 +3812,7 @@ async def confirm_tariff_switch(
     if subscription.tariff_id and subscription.tariff_id != tariff_id:
         cur_tariff_obj = await get_tariff_by_id(db, subscription.tariff_id)
         if cur_tariff_obj:
-            rem_days = max(0, (subscription.end_date - datetime.now(UTC)).days) if subscription.end_date else 0
+            rem_days = remaining_days_for_switch(subscription.end_date)
             _, is_up = _calculate_instant_switch_cost(cur_tariff_obj, tariff, rem_days, db_user)
             if is_up and not settings.TARIFF_SWITCH_UPGRADE_ENABLED:
                 await callback.answer(
@@ -3889,18 +3909,19 @@ async def confirm_tariff_switch(
             else:
                 _should_create = not getattr(db_user, 'remnawave_id', None)
 
+            reset_used_traffic = should_reset_used_traffic(final_price)
             if _should_create:
                 await subscription_service.create_remnawave_user(
                     db,
                     subscription,
-                    reset_traffic=settings.RESET_TRAFFIC_ON_TARIFF_SWITCH,
+                    reset_traffic=reset_used_traffic,
                     reset_reason='переключение тарифа',
                 )
             else:
                 await subscription_service.update_remnawave_user(
                     db,
                     subscription,
-                    reset_traffic=settings.RESET_TRAFFIC_ON_TARIFF_SWITCH,
+                    reset_traffic=reset_used_traffic,
                     reset_reason='переключение тарифа',
                 )
         except Exception as e:
@@ -4093,7 +4114,7 @@ async def confirm_daily_tariff_switch(
     if subscription.tariff_id and subscription.tariff_id != tariff_id:
         cur_tariff_daily = await get_tariff_by_id(db, subscription.tariff_id)
         if cur_tariff_daily:
-            rem_days = max(0, (subscription.end_date - datetime.now(UTC)).days) if subscription.end_date else 0
+            rem_days = remaining_days_for_switch(subscription.end_date)
             _, is_up = _calculate_instant_switch_cost(cur_tariff_daily, tariff, rem_days, db_user)
             if is_up and not settings.TARIFF_SWITCH_UPGRADE_ENABLED:
                 await callback.answer(
@@ -4170,7 +4191,9 @@ async def confirm_daily_tariff_switch(
         subscription.purchased_traffic_gb = 0
         subscription.traffic_reset_at = None
 
-        if settings.RESET_TRAFFIC_ON_TARIFF_SWITCH:
+        # Счётчик трафика обнуляет только ОПЛАЧЕННОЕ переключение (см. tariff_switch_policy).
+        reset_used_traffic = should_reset_used_traffic(final_daily_price)
+        if reset_used_traffic:
             subscription.traffic_used_gb = 0.0
 
         await db.commit()
@@ -4188,14 +4211,14 @@ async def confirm_daily_tariff_switch(
                 await subscription_service.create_remnawave_user(
                     db,
                     subscription,
-                    reset_traffic=settings.RESET_TRAFFIC_ON_TARIFF_SWITCH,
+                    reset_traffic=reset_used_traffic,
                     reset_reason='смена на суточный тариф',
                 )
             else:
                 await subscription_service.update_remnawave_user(
                     db,
                     subscription,
-                    reset_traffic=settings.RESET_TRAFFIC_ON_TARIFF_SWITCH,
+                    reset_traffic=reset_used_traffic,
                     reset_reason='смена на суточный тариф',
                 )
         except Exception as e:
@@ -4545,11 +4568,8 @@ async def show_instant_switch_list(
         await show_tariff_switch_list(callback, db_user, db, state)
         return
 
-    # Рассчитываем оставшиеся дни
     now = datetime.now(UTC)
-    remaining_days = 0
-    if subscription.end_date:
-        remaining_days = max(0, (subscription.end_date - now).days)
+    remaining_days = remaining_days_for_switch(subscription.end_date, now)
 
     if not subscription.end_date or subscription.end_date <= now:
         await callback.message.edit_text(
@@ -4678,7 +4698,7 @@ async def preview_instant_switch(
         return
 
     if not remaining_days and subscription.end_date:
-        remaining_days = max(0, (subscription.end_date - datetime.now(UTC)).days)
+        remaining_days = remaining_days_for_switch(subscription.end_date)
 
     # Рассчитываем стоимость переключения
     upgrade_cost, is_upgrade = _calculate_instant_switch_cost(current_tariff, new_tariff, remaining_days, db_user)
@@ -4969,7 +4989,11 @@ async def confirm_instant_switch(
         await show_tariff_switch_list(callback, db_user, db, state)
         return
 
-    remaining_days = max(0, (subscription.end_date - datetime.now(UTC)).days) if subscription.end_date else 0
+    # Оверлей грейса, осевший в подписке (v4.10–4.11), — не её срок: вернуть до расчёта.
+    from app.services.grace_access_echo import undo_grace_overlay_echo
+
+    await undo_grace_overlay_echo(db, subscription)
+    remaining_days = remaining_days_for_switch(subscription.end_date)
 
     # Use full TariffSwitchResult to access offer_discount_pct for consume_promo_offer flag
     from app.services.pricing_engine import pricing_engine
@@ -5067,7 +5091,9 @@ async def confirm_instant_switch(
         subscription.purchased_traffic_gb = 0
         subscription.traffic_reset_at = None
 
-        if settings.RESET_TRAFFIC_ON_TARIFF_SWITCH:
+        # Счётчик трафика обнуляет только ОПЛАЧЕННОЕ переключение (см. tariff_switch_policy).
+        reset_used_traffic = should_reset_used_traffic(upgrade_cost)
+        if reset_used_traffic:
             subscription.traffic_used_gb = 0.0
 
         if is_new_daily:
@@ -5145,14 +5171,14 @@ async def confirm_instant_switch(
                 await subscription_service.create_remnawave_user(
                     db,
                     subscription,
-                    reset_traffic=settings.RESET_TRAFFIC_ON_TARIFF_SWITCH,
+                    reset_traffic=reset_used_traffic,
                     reset_reason='мгновенное переключение тарифа',
                 )
             else:
                 await subscription_service.update_remnawave_user(
                     db,
                     subscription,
-                    reset_traffic=settings.RESET_TRAFFIC_ON_TARIFF_SWITCH,
+                    reset_traffic=reset_used_traffic,
                     reset_reason='мгновенное переключение тарифа',
                 )
         except Exception as e:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import hashlib
 import json
 import mimetypes
@@ -23,6 +24,7 @@ from starlette.websockets import WebSocketState
 
 from app.bot_factory import create_bot
 from app.cabinet.auth.jwt_handler import get_token_payload
+from app.cabinet.auth.registration_access import evaluate_public_registration
 from app.cabinet.auth.telegram_auth import validate_telegram_init_data
 from app.cabinet.routes.media import (
     _BLOCKED_UPLOAD_CONTENT_TYPES,
@@ -44,8 +46,14 @@ from app.services.blacklist_service import blacklist_service
 from app.services.maintenance_service import maintenance_service
 from app.services.permission_service import PermissionService
 from app.services.rbac_bootstrap_service import is_user_admin_by_env
+from app.services.registration_access_service import (
+    RegistrationAccessDecision,
+    RegistrationAccessReason,
+    RegistrationChannel,
+)
 from app.services.support_settings_service import SupportSettingsService
 from app.services.user_revival_service import NotDeletedError, revive_deleted_user
+from app.utils.websocket_errors import is_client_gone
 
 
 logger = structlog.get_logger(__name__)
@@ -396,9 +404,32 @@ async def _apply_cabinet_account_guards(
             return _shared_error('FORBIDDEN', 'User is blacklisted', resource_type='auth')
 
     status_value = _user_status_value(user)
+    access_decision = None
+    if status_value != UserStatus.ACTIVE.value:
+        if is_user_admin_by_env(user).is_admin:
+            # Env config outranks any status flag — see get_current_cabinet_user.
+            access_decision = RegistrationAccessDecision(True, RegistrationAccessReason.VERIFIED_ADMIN)
+        elif not settings.INVITE_ONLY_ENABLED:
+            access_decision = RegistrationAccessDecision(True, RegistrationAccessReason.INVITE_ONLY_DISABLED)
+        else:
+            access_decision = await evaluate_public_registration(
+                db,
+                channel=RegistrationChannel.CABINET_SUPPORT_WS,
+                existing_user=user,
+                telegram_id=user.telegram_id,
+                email=user.email,
+                email_verified=bool(user.email_verified),
+                verified_admin=False,
+            )
     if status_value != UserStatus.ACTIVE.value:
         can_auto_revive = (
-            status_value == UserStatus.DELETED.value and user.telegram_id is not None and init_data_matches_user
+            status_value == UserStatus.DELETED.value
+            and user.telegram_id is not None
+            and (
+                init_data_matches_user
+                or bool(access_decision and access_decision.reason is RegistrationAccessReason.VERIFIED_ADMIN)
+            )
+            and bool(access_decision and access_decision.allowed)
         )
         if can_auto_revive:
             try:
@@ -407,6 +438,11 @@ async def _apply_cabinet_account_guards(
                 await db.refresh(user)
             except NotDeletedError:
                 logger.info('Support WS auto-revival race: user already revived', user_id=user.id)
+        elif access_decision and access_decision.reason is RegistrationAccessReason.VERIFIED_ADMIN:
+            user.status = UserStatus.ACTIVE.value
+            user.updated_at = datetime.now(UTC)
+            await db.commit()
+            await db.refresh(user)
         elif status_value == UserStatus.DELETED.value:
             return _shared_error(
                 'FORBIDDEN', 'Account is deleted and must be restored through the bot', resource_type='auth'
@@ -1387,7 +1423,9 @@ def _map_exception(command: str, exc: Exception) -> dict[str, Any]:
             'upload' if message.startswith('UPLOAD_') else 'download' if message.startswith('DOWNLOAD_') else 'ticket'
         )
         return _shared_error(message, message.replace('_', ' ').title(), resource_type=resource_type)
-    logger.exception('Support WS command failed', command=command, error=message)
+    # exception() вне блока except печатает пустой traceback «NoneType: None» —
+    # исключение сюда приходит аргументом, поэтому передаём его явно.
+    logger.error('Support WS command failed', command=command, error=message, exc_info=exc)
     return _shared_error('INTERNAL_ERROR', 'Internal support websocket error', retryable=True)
 
 
@@ -1450,7 +1488,15 @@ async def support_mobile_websocket_endpoint(websocket: WebSocket):
         await _reject_upgrade(websocket, 401, error['code'] if error else 'AUTH_REQUIRED')
         return
 
-    await websocket.accept(subprotocol=SUPPORTED_SUBPROTOCOL)
+    try:
+        await websocket.accept(subprotocol=SUPPORTED_SUBPROTOCOL)
+    except Exception as exc:
+        # Приложение закрыли, пока шло рукопожатие, — разговор окончен, аварии нет.
+        if is_client_gone(exc):
+            logger.debug('Support WS: client gone before accept')
+            return
+        raise
+
     session = SupportWsSession(websocket=websocket, context=context)
     await support_ws_manager.connect(session)
     try:
@@ -1514,16 +1560,16 @@ async def support_mobile_websocket_endpoint(websocket: WebSocket):
                     command = command if 'command' in locals() else 'unknown'
                     request_id = request_id if 'request_id' in locals() else ''
                     await session.send_json(_command_result(command, request_id, error=_map_exception(command, exc)))
-                except Exception:
-                    logger.exception('Support WS failed to send command error')
+                except Exception as send_error:
+                    if not is_client_gone(send_error):
+                        logger.exception('Support WS failed to send command error')
                     break
     finally:
         await support_ws_manager.disconnect(session)
         if websocket.client_state != WebSocketState.DISCONNECTED:
-            try:
+            # Сокет мог закрыться сам, пока мы шли к finally — повторное закрытие не ошибка.
+            with contextlib.suppress(RuntimeError):
                 await websocket.close()
-            except RuntimeError:
-                pass
 
 
 # ---------------------------------------------------------------------------

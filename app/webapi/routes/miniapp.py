@@ -36,6 +36,8 @@ from app.database.crud.subscription import (
     add_subscription_servers,
     create_trial_subscription,
     extend_subscription,
+    get_active_subscriptions_by_user_id,
+    get_subscription_by_user_id,
     remove_subscription_servers,
     update_subscription_autopay,
 )
@@ -63,6 +65,7 @@ from app.services.privacy_policy_service import PrivacyPolicyService
 from app.services.promo_offer_service import promo_offer_service
 from app.services.promocode_service import PromoCodeService
 from app.services.public_offer_service import PublicOfferService
+from app.services.referral_reward_service import format_reward_total
 from app.services.remnawave_service import (
     RemnaWaveConfigurationError,
     RemnaWaveService,
@@ -82,6 +85,7 @@ from app.services.subscription_renewal_service import (
     with_admin_notification_service,
 )
 from app.services.subscription_service import SubscriptionService
+from app.services.tariff_switch_policy import remaining_days_for_switch, should_reset_used_traffic
 from app.services.trial_activation_service import (
     TrialPaymentChargeFailed,
     TrialPaymentInsufficientFunds,
@@ -91,6 +95,7 @@ from app.services.trial_activation_service import (
     rollback_trial_subscription_activation,
 )
 from app.services.tribute_service import TributeService
+from app.services.user_action_log_service import mark_user_seen, schedule_miniapp_action_log
 from app.utils.currency_converter import currency_converter
 from app.utils.pricing_utils import (
     apply_percentage_discount,
@@ -99,6 +104,7 @@ from app.utils.pricing_utils import (
     format_period_description,
 )
 from app.utils.promo_offer import get_user_active_promo_discount_percent
+from app.utils.subscription_time import days_left_rounded_up
 from app.utils.subscription_utils import get_happ_cryptolink_redirect_link
 from app.utils.telegram_webapp import (
     TelegramWebAppAuthError,
@@ -2931,6 +2937,39 @@ async def _build_referral_info(
         get_effective_referral_commission_percent(user) if user else referral_settings.get('commission_percent') or 0
     )
 
+    # Под многоуровневой схемой плоские поля выше не управляют ни одним начислением.
+    # Описание берётся из того же источника, что и расчёт, — иначе миниапп обещает
+    # проценты и бонусы, которых бот не платит.
+    level_descriptions: list[str] = []
+    referee_bonus: str | None = None
+    tier_progress = None
+    if settings.is_referral_levels_scheme():
+        # Без имён тарифов строка «7 дн. подписки» умалчивает, в какой тариф эти
+        # дни лягут, — в боте и кабинете тариф называется, а миниапп его терял.
+        from app.database.models import Tariff
+        from app.services.referral_reward_service import (
+            ReferralRewardLevelService,
+            describe_active_levels,
+            describe_referee_bonus,
+            resolve_tier_progress,
+        )
+
+        configs = await ReferralRewardLevelService.get_all(db)
+        tariff_ids = {cfg.referrer_tariff_id for cfg in configs.values() if cfg.referrer_tariff_id}
+        tariff_ids |= {cfg.referee_tariff_id for cfg in configs.values() if cfg.referee_tariff_id}
+        tariff_names: dict[int, str] = {}
+        if tariff_ids:
+            rows = await db.execute(select(Tariff.id, Tariff.name).where(Tariff.id.in_(tariff_ids)))
+            tariff_names = {row.id: row.name for row in rows.all()}
+
+        level_descriptions = await describe_active_levels(
+            db, tariff_names=tariff_names, language=user.language, viewer=user
+        )
+        referee_bonus = await describe_referee_bonus(
+            db, tariff_names=tariff_names, language=user.language, referrer=user
+        )
+        tier_progress = await resolve_tier_progress(db, user)
+
     terms = MiniAppReferralTerms(
         minimum_topup_kopeks=minimum_topup_kopeks,
         minimum_topup_label=settings.format_price(minimum_topup_kopeks),
@@ -2939,6 +2978,13 @@ async def _build_referral_info(
         inviter_bonus_kopeks=inviter_bonus_kopeks,
         inviter_bonus_label=settings.format_price(inviter_bonus_kopeks),
         commission_percent=commission_percent,
+        scheme='levels' if settings.is_referral_levels_scheme() else 'legacy',
+        level_descriptions=level_descriptions,
+        referee_bonus_description=referee_bonus,
+        levels_mode=settings.get_referral_levels_mode() if settings.is_referral_levels_scheme() else 'chain',
+        tier_current_level=tier_progress.current_level if tier_progress else None,
+        tier_next_level=tier_progress.next_level if tier_progress else None,
+        tier_next_remaining=tier_progress.next_remaining if tier_progress else 0,
     )
 
     summary = await get_user_referral_summary(db, user.id)
@@ -2954,18 +3000,28 @@ async def _build_referral_info(
             paid_referrals_count=int(summary.get('paid_referrals_count') or 0),
             active_referrals_count=int(summary.get('active_referrals_count') or 0),
             total_earned_kopeks=total_earned_kopeks,
-            total_earned_label=settings.format_price(total_earned_kopeks),
+            total_earned_label=format_reward_total(
+                total_earned_kopeks, int(summary.get('total_earned_days') or 0), user.language
+            ),
+            total_earned_days=int(summary.get('total_earned_days') or 0),
             month_earned_kopeks=month_earned_kopeks,
-            month_earned_label=settings.format_price(month_earned_kopeks),
+            month_earned_label=format_reward_total(
+                month_earned_kopeks, int(summary.get('month_earned_days') or 0), user.language
+            ),
+            month_earned_days=int(summary.get('month_earned_days') or 0),
             conversion_rate=float(summary.get('conversion_rate') or 0.0),
         )
 
         for earning in summary.get('recent_earnings', []) or []:
             amount = int(earning.get('amount_kopeks') or 0)
+            earned_days = int(earning.get('days_granted') or 0)
             recent_earnings.append(
                 MiniAppReferralRecentEarning(
                     amount_kopeks=amount,
-                    amount_label=settings.format_price(amount),
+                    amount_label=format_reward_total(amount, earned_days, user.language),
+                    days_granted=earned_days,
+                    reward_type=str(earning.get('reward_type') or 'money'),
+                    level=int(earning.get('level') or 1),
                     reason=earning.get('reason'),
                     referral_name=earning.get('referral_name'),
                     created_at=earning.get('created_at'),
@@ -2977,6 +3033,7 @@ async def _build_referral_info(
     if detailed:
         for item in detailed.get('referrals', []) or []:
             total_earned = int(item.get('total_earned_kopeks') or 0)
+            item_days = int(item.get('days_earned') or 0)
             balance = int(item.get('balance_kopeks') or 0)
             referral_items.append(
                 MiniAppReferralItem(
@@ -2990,7 +3047,8 @@ async def _build_referral_info(
                     balance_kopeks=balance,
                     balance_label=settings.format_price(balance),
                     total_earned_kopeks=total_earned,
-                    total_earned_label=settings.format_price(total_earned),
+                    total_earned_days=item_days,
+                    total_earned_label=format_reward_total(total_earned, item_days, user.language),
                     topups_count=int(item.get('topups_count') or 0),
                     days_since_registration=item.get('days_since_registration'),
                     days_since_activity=item.get('days_since_activity'),
@@ -3265,7 +3323,7 @@ async def get_subscription_details(
                 raw_content = (page.content or '').strip()
                 if not raw_content:
                     continue
-                if not re.sub(r'<[^>]+>', '', raw_content).strip():
+                if not re.sub(r'<[^<>]+>', '', raw_content).strip():
                     continue
                 faq_items.append(
                     MiniAppFaqItem(
@@ -3489,8 +3547,7 @@ async def get_subscription_details(
         purchases = purchases_result.scalars().all()
 
         for purchase in purchases:
-            time_remaining = purchase.expires_at - now
-            days_remaining = max(0, int(time_remaining.total_seconds() / 86400))
+            days_remaining = days_left_rounded_up(purchase.expires_at, now)
             total_duration_seconds = (purchase.expires_at - purchase.created_at).total_seconds()
             elapsed_seconds = (now - purchase.created_at).total_seconds()
             progress_percent = min(
@@ -3617,6 +3674,8 @@ async def _get_current_tariff_model(db: AsyncSession, subscription, user=None) -
                 continue
 
             base_price = package.price_kopeks
+            if not base_price or base_price <= 0:
+                continue
             discounted_price, _discount_val, traffic_discount_pct = pricing_engine.calculate_traffic_discount(
                 base_price,
                 user,
@@ -4827,6 +4886,20 @@ async def _authorize_miniapp_user(
             status.HTTP_403_FORBIDDEN,
             detail={'code': 'account_blocked', 'message': 'Account is blocked or deleted'},
         )
+
+    # Mini App — тоже активность: по метке карточка показывает «последнюю
+    # активность», а сторож неактивных решает, кого удалять.
+    if mark_user_seen(user):
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+
+    # Единственное место, где запрос Mini App знает пользователя: init_data
+    # приходит телом, поэтому общей зависимости с Request здесь нет. Путь
+    # берётся из контекста запроса; действие пишется как действие, просмотр
+    # экрана — как экран, гейты — внутри планировщика.
+    schedule_miniapp_action_log(user.id)
 
     return user
 
@@ -6531,11 +6604,7 @@ async def get_tariffs_endpoint(
     current_tariff_model: MiniAppCurrentTariff | None = None
     current_tariff = None
 
-    # Вычисляем оставшиеся дни подписки
-    remaining_days = 0
-    if subscription and subscription.end_date:
-        delta = subscription.end_date - datetime.now(UTC)
-        remaining_days = max(0, delta.days)
+    remaining_days = remaining_days_for_switch(subscription.end_date if subscription else None)
 
     if current_tariff_id:
         current_tariff = await get_tariff_by_id(db, current_tariff_id)
@@ -6708,6 +6777,17 @@ async def purchase_tariff_endpoint(
         all_servers, _ = await get_all_server_squads(db, available_only=True)
         squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
 
+    # Какую подписку продлевать. Переменной здесь не было вовсе: `if subscription:`
+    # падало NameError на КАЖДОЙ покупке тарифа через этот эндпоинт. Разрешение
+    # повторяет рабочий путь бота (app/handlers/subscription/tariff_purchase.py):
+    # в мультитарифе берётся подписка на ЭТОТ тариф, в классическом режиме —
+    # единственная подписка пользователя.
+    if settings.is_multi_tariff_enabled():
+        active_subs = await get_active_subscriptions_by_user_id(db, user.id)
+        subscription = next((s for s in active_subs if s.tariff_id == tariff.id), None)
+    else:
+        subscription = await get_subscription_by_user_id(db, user.id)
+
     if subscription:
         # Preserve extra purchased devices when renewing the same tariff
         if subscription.tariff_id == tariff.id:
@@ -6748,15 +6828,14 @@ async def purchase_tariff_endpoint(
         await db.commit()
         await db.refresh(subscription)
 
-    # Синхронизируем с RemnaWave
-    # При покупке тарифа ВСЕГДА сбрасываем трафик в панели
+    # Синхронизируем с RemnaWave: новая подписка панели ещё не известна — sync
+    # выберет create; существующая — update. При покупке тарифа ВСЕГДА сбрасываем трафик.
     service = SubscriptionService()
-    await service.update_remnawave_user(
+    await service.sync_remnawave_user(
         db,
         subscription,
         reset_traffic=True,
         reset_reason='покупка тарифа (miniapp)',
-        sync_squads=True,
     )
 
     # Сохраняем корзину для автопродления
@@ -6904,11 +6983,7 @@ async def preview_tariff_switch_endpoint(
             detail={'code': 'tariff_not_available', 'message': 'Tariff not available for your promo group'},
         )
 
-    # Рассчитываем оставшиеся дни
-    remaining_days = 0
-    if subscription.end_date and subscription.end_date > datetime.now(UTC):
-        delta = subscription.end_date - datetime.now(UTC)
-        remaining_days = max(0, delta.days)
+    remaining_days = remaining_days_for_switch(subscription.end_date)
 
     # Рассчитываем стоимость переключения (PricingEngine обрабатывает все случаи: periodic↔periodic, daily↔periodic)
     switch_result = _calculate_tariff_switch(current_tariff, new_tariff, remaining_days, user=user)
@@ -7038,11 +7113,11 @@ async def switch_tariff_endpoint(
 
     user = await lock_user_for_pricing(db, user.id)
 
-    # Рассчитываем оставшиеся дни
-    remaining_days = 0
-    if subscription.end_date and subscription.end_date > datetime.now(UTC):
-        delta = subscription.end_date - datetime.now(UTC)
-        remaining_days = max(0, delta.days)
+    # Оверлей грейса, осевший в подписке (v4.10–4.11), — не её срок: вернуть до расчёта.
+    from app.services.grace_access_echo import undo_grace_overlay_echo
+
+    await undo_grace_overlay_echo(db, subscription)
+    remaining_days = remaining_days_for_switch(subscription.end_date)
 
     # Рассчитываем стоимость (PricingEngine обрабатывает все случаи)
     switch_result = _calculate_tariff_switch(current_tariff, new_tariff, remaining_days, user=user)
@@ -7139,7 +7214,9 @@ async def switch_tariff_endpoint(
     subscription.purchased_traffic_gb = 0
     subscription.traffic_reset_at = None
 
-    if settings.RESET_TRAFFIC_ON_TARIFF_SWITCH:
+    # Счётчик трафика обнуляет только ОПЛАЧЕННОЕ переключение (см. tariff_switch_policy).
+    reset_used_traffic = should_reset_used_traffic(upgrade_cost)
+    if reset_used_traffic:
         subscription.traffic_used_gb = 0.0
 
     # Обработка daily полей при смене тарифа
@@ -7187,7 +7264,7 @@ async def switch_tariff_endpoint(
     await db.refresh(user)
 
     # Синхронизируем с RemnaWave (опционально сбрасываем трафик по настройке)
-    should_reset_traffic = settings.RESET_TRAFFIC_ON_TARIFF_SWITCH
+    should_reset_traffic = reset_used_traffic
     try:
         service = SubscriptionService()
         await service.update_remnawave_user(
@@ -7398,6 +7475,18 @@ async def purchase_traffic_topup_endpoint(
         )
 
     base_price_kopeks = packages[payload.gb]
+    if not base_price_kopeks or base_price_kopeks <= 0:
+        # Без этой проверки пакет с непроставленной ценой продавался за 0 ₽ —
+        # трафик выдавался бесплатно. Бот и кабинет такой пакет не показывают
+        # и не продают; список Mini App теперь тоже, но запрос приходит извне
+        # и на список не опирается.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                'code': 'package_not_priced',
+                'message': f'Traffic package {payload.gb}GB has no price configured',
+            },
+        )
 
     # Lock user BEFORE price computation to prevent TOCTOU on promo discount
     from app.database.crud.user import lock_user_for_pricing
@@ -7559,6 +7648,7 @@ async def toggle_daily_subscription_pause_endpoint(
         SubscriptionStatus.EXPIRED.value,
         SubscriptionStatus.LIMITED.value,
     )
+    was_limited = subscription.status == SubscriptionStatus.LIMITED.value
 
     # System-DISABLED subs (is_daily_paused=False) должны идти по пути resume
     if was_disabled and not is_currently_paused:
@@ -7682,6 +7772,12 @@ async def toggle_daily_subscription_pause_endpoint(
             logger.warning('Failed to restore connected_squads (miniapp)', error=sq_err)
 
         # Sync with RemnaWave
+        # Возобновление списывает суточную оплату — обнуление счётчика решает
+        # общая политика суточного списания, а не жёсткая константа.
+        from app.services.traffic_reset_policy import lift_panel_traffic_limit, should_reset_traffic_on_daily_charge
+
+        reset_traffic = should_reset_traffic_on_daily_charge(tariff)
+        reset_reason = 'суточное списание (возобновление)' if reset_traffic else None
         try:
             service = SubscriptionService()
             # Гейт «обновлять или создавать» обязан смотреть на ту же идентичность,
@@ -7697,16 +7793,16 @@ async def toggle_daily_subscription_pause_endpoint(
                 await service.update_remnawave_user(
                     db,
                     subscription,
-                    reset_traffic=False,
-                    reset_reason=None,
+                    reset_traffic=reset_traffic,
+                    reset_reason=reset_reason,
                     sync_squads=True,
                 )
             else:
                 await service.create_remnawave_user(
                     db,
                     subscription,
-                    reset_traffic=False,
-                    reset_reason=None,
+                    reset_traffic=reset_traffic,
+                    reset_reason=reset_reason,
                 )
                 # POST /api/users may ignore activeInternalSquads —
                 # follow up with PATCH to ensure internal squads are assigned
@@ -7719,6 +7815,8 @@ async def toggle_daily_subscription_pause_endpoint(
                 )
                 if _created_panel_user_id and subscription.connected_squads:
                     try:
+                        # Досыл сквадов — часть того же события оплаты:
+                        # счётчик уже обнулён вызовом выше, второй раз не надо.
                         await service.update_remnawave_user(
                             db,
                             subscription,
@@ -7727,6 +7825,15 @@ async def toggle_daily_subscription_pause_endpoint(
                         )
                     except Exception as squad_err:
                         logger.warning('Failed to sync squads after user creation (miniapp)', error=squad_err)
+
+            if reset_traffic:
+                # Счётчик бота ведут по данным панели, но до ближайшего прохода
+                # мониторинга он показывал бы исчерпанный трафик.
+                subscription.traffic_used_gb = 0.0
+                await db.commit()
+                if was_limited:
+                    # PATCH сам по себе статус «трафик исчерпан» не снимает.
+                    await lift_panel_traffic_limit(db, subscription, service=service)
         except Exception as e:
             logger.error('Ошибка синхронизации с RemnaWave при возобновлении', error=e)
             from app.services.remnawave_retry_queue import remnawave_retry_queue
