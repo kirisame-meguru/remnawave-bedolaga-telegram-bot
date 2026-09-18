@@ -54,7 +54,7 @@ def _undefined_names() -> dict[str, set[str]]:
 
     found: dict[str, set[str]] = {}
     for item in json.loads(result.stdout or '[]'):
-        path = str(pathlib.Path(item['filename']).relative_to(ROOT))
+        path = pathlib.Path(item['filename']).relative_to(ROOT).as_posix()
         name = item['message'].removeprefix('Undefined name ').strip('`')
         found.setdefault(path, set()).add(name)
     return found

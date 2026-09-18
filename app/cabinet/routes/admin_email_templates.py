@@ -703,7 +703,7 @@ TEMPLATE_TYPES = [
         {
             'type': type_value,
             'label': {
-                lang: re.sub(r'<[^>]+>', '', get_texts(lang).t(type_value.upper(), '').split('\n', 1)[0]).format(
+                lang: re.sub(r'<[^<>]+>', '', get_texts(lang).t(type_value.upper(), '').split('\n', 1)[0]).format(
                     dimension=label
                 )
                 for lang, label in {'ru': 'Трафик', 'en': 'Traffic', 'zh': '流量', 'ua': 'Трафік'}.items()

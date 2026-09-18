@@ -56,6 +56,13 @@ def test_default_template_renders_clean_for_every_language(type_key, lang):
     assert 'None' not in subject, f'{type_key}/{lang}: артефакт None в теме'
 
 
+def test_dimension_email_subject_preserves_literal_angle_brackets():
+    context = {**SAMPLE_CONTEXTS['traffic_dimension_warning'], 'dimension': '1 < 2'}
+    template = _get_default_template('traffic_dimension_warning', 'en', context)
+
+    assert '1 < 2' in template['subject']
+
+
 # ============ Единый источник дефолтов в email_service ============
 
 

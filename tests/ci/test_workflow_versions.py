@@ -22,10 +22,6 @@ WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / '.github' / 'workflows'
 # uses: owner/repo@версия  (с необязательным путём внутри репозитория)
 USES_RE = re.compile(r'uses:\s*(?P<action>[\w.-]+/[\w./-]+)@(?P<version>[^\s#]+)')
 
-# Действия, закреплённые на конкретный коммит ради воспроизводимости сборки:
-# для них разнобой версий проверять нечего.
-SHA_PINNED = re.compile(r'^[0-9a-f]{40}$')
-
 PYTHON_VERSION_RE = re.compile(r'python-version:\s*(?P<quote>["\']?)(?P<version>[^"\'\s]+)(?P=quote)')
 
 # Версия PostgreSQL в CI обязана совпадать с боевой из docker-compose:
@@ -46,26 +42,6 @@ def _collect(pattern: re.Pattern, group: str) -> dict[str, set[str]]:
         for match in pattern.finditer(path.read_text(encoding='utf-8')):
             found[match.group(group)].add(path.name)
     return found
-
-
-def test_every_action_is_pinned_to_a_single_version() -> None:
-    """Одно действие — одна версия во всём репозитории."""
-    versions: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-
-    for path in _workflow_files():
-        for match in USES_RE.finditer(path.read_text(encoding='utf-8')):
-            version = match.group('version')
-            if SHA_PINNED.match(version):
-                continue
-            versions[match.group('action')][version].add(path.name)
-
-    conflicts = {
-        action: {version: sorted(files) for version, files in by_version.items()}
-        for action, by_version in versions.items()
-        if len(by_version) > 1
-    }
-
-    assert not conflicts, f'одно действие закреплено на разные версии: {conflicts}'
 
 
 def test_all_actions_are_pinned() -> None:

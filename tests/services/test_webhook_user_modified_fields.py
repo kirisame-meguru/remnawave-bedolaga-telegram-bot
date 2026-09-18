@@ -2,12 +2,13 @@
 
 Ручка вебхуков была покрыта только на уровне HTTP (подпись, разбор события), а
 её правила синхронизации полей — нет. Здесь они закреплены: событие свежее
-любого снимка, поэтому дата и лимит трафика берутся при любом статусе панели, но
+любого снимка, поэтому дата берётся при любом статусе панели, но
 
 * подписку, намеренно отключённую в боте (обнуление админом), вебхук не
   воскрешает: у панели могла остаться старая дата, и списанные дни вернулись бы;
 * истёкшей подписку вебхук не объявляет — это работа мониторинга с его буфером
   и уведомлениями;
+* лимит трафика остаётся собственностью бота: панельный лимит включает shield;
 * ссылки приходят по сети, поэтому непрошедшие проверку не сохраняются: иначе в
   базу попадает чужой адрес и уезжает пользователю;
 * пока открыт грейс, дата, статус и лимит — собственность бота.
@@ -117,7 +118,7 @@ async def test_webhook_never_declares_a_subscription_expired(service):
 
 
 @pytest.mark.asyncio
-async def test_traffic_limit_and_nested_usage_are_synced(service):
+async def test_nested_usage_is_synced_without_importing_shielded_traffic_limit(service):
     """Расширенная схема панели прячет расход в userTraffic, плоского поля там нет."""
     subscription = _subscription()
 
@@ -128,7 +129,7 @@ async def test_traffic_limit_and_nested_usage_are_synced(service):
         _payload(trafficLimitBytes=250 * 1024**3, userTraffic={'usedTrafficBytes': 5 * 1024**3}),
     )
 
-    assert subscription.traffic_limit_gb == 250
+    assert subscription.traffic_limit_gb == 100
     assert subscription.traffic_used_gb == 5.0
 
 

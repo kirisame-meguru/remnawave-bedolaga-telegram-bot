@@ -9,36 +9,11 @@ CodeQL (py/polynomial-redos, high) показал это на `app/utils/rich_no
 остаётся текстом, а не съедается как незакрытый тег.
 """
 
-import re
 import time
-from pathlib import Path
 
 import pytest
 
-
-APP_ROOT = Path(__file__).resolve().parents[2] / 'app'
-
-# Модули, где вырезание тегов работает с текстом, который так или иначе пришёл
-# снаружи. Список ведётся руками: проверка ниже всё равно обходит весь app/.
-LINEAR_PATTERN = r'<[^<>]+>'
-
-
-def _python_sources() -> list[Path]:
-    return [path for path in APP_ROOT.rglob('*.py') if '__pycache__' not in path.parts]
-
-
-def test_no_quadratic_tag_pattern_remains():
-    """Шаблон `<[^>]+>` не должен вернуться ни в один модуль."""
-    offenders = [
-        str(path.relative_to(APP_ROOT.parent))
-        for path in _python_sources()
-        if '<[^>]+>' in path.read_text(encoding='utf-8')
-    ]
-
-    assert offenders == [], (
-        'Квадратичное вырезание тегов вернулось. Нужен <[^<>]+>: на строке из '
-        f'одних "<" вариант с [^>] перебирает хвост заново с каждой позиции. {offenders}'
-    )
+from app.utils.rich_notify import _visible_length
 
 
 @pytest.mark.parametrize(
@@ -52,7 +27,7 @@ def test_no_quadratic_tag_pattern_remains():
     ],
 )
 def test_stripping_keeps_text_and_bare_angle_brackets(source, expected):
-    assert re.sub(LINEAR_PATTERN, '', source) == expected
+    assert _visible_length(source) == len(expected)
 
 
 def test_pathological_input_stays_fast():
@@ -60,20 +35,12 @@ def test_pathological_input_stays_fast():
     payload = '<' * 40_000
 
     start = time.perf_counter()
-    re.sub(LINEAR_PATTERN, '', payload)
+    assert _visible_length(payload) == len(payload)
     elapsed = time.perf_counter() - start
 
     # Старый шаблон на этом входе тратил доли секунды и рос квадратично;
     # запас взят большой, чтобы тест не мигал на нагруженной машине.
     assert elapsed < 0.1, f'вырезание тегов заняло {elapsed:.3f}s — шаблон снова квадратичный'
-
-
-def test_visible_length_uses_the_linear_pattern():
-    """Функция, на которую указал CodeQL, считает длину тем же способом."""
-    from app.utils.rich_notify import _visible_length
-
-    assert _visible_length('<b>Тариф</b>') == 5
-    assert _visible_length('1 < 2') == 5
 
 
 def test_html_validator_stays_fast_on_unclosed_tags():

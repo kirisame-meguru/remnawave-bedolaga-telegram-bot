@@ -71,3 +71,18 @@ def test_payment_mixins_are_documented() -> None:
     mixins = sorted(Path('app/services/payment').glob('*.py'))
     missing = [m.name for m in mixins if m.name != '__init__.py' and f'`{m.as_posix()}`' not in document]
     assert not missing, f'платёжные миксины не попали в документ: {missing}'
+
+
+def test_generation_order_is_identical_on_windows_and_posix(monkeypatch):
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    from scripts import generate_structure_reference as generator
+
+    names = ('README.txt', 'alpha.txt', 'Zoo/readme.txt', 'bar/readme.txt')
+    documents = []
+    for path_type in (PurePosixPath, PureWindowsPath):
+        monkeypatch.setattr(generator, 'Path', path_type)
+        monkeypatch.setattr(generator, 'REPO_ROOT', path_type())
+        documents.append(generator.render([path_type(name) for name in names]))
+
+    assert documents[0] == documents[1]

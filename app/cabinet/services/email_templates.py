@@ -875,7 +875,7 @@ class EmailNotificationTemplates:
 
         # Первая строка локали — заголовок вида "<b>...</b>", остальное — тело.
         head, _, rest = rendered.partition('\n')
-        subject = re.sub(r'<[^>]+>', '', head).strip()
+        subject = re.sub(r'<[^<>]+>', '', head).strip()
         tone = self._TRAFFIC_DIMENSION_EMAIL_TONE.get(notification_type.value, 'highlight')
         body = rest.strip().replace('\n', '<br>')
 

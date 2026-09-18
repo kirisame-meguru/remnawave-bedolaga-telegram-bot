@@ -108,6 +108,11 @@ dimension protections in these shared modules, not in the old callers:
 - Automatic pulls and webhooks do not import the panel's shield-inflated traffic limit
   into the paid base quota. Explicit admin imports still accept panel limits.
 - Dimension notification types remain available for delivery and in the email editor.
+- Per-inbound readings use the custom panel endpoint and UTC-day buckets; stock
+  panel endpoint lists and operator-local calendar rules do not describe this contract.
+
+The structure-reference generator sorts POSIX path strings explicitly so Windows
+and Linux produce the same committed document.
 
 The `xb` branch remains independent; no existing migration is re-parented.
 Source-scanning style/architecture assertions are not retained as behavioral tests.

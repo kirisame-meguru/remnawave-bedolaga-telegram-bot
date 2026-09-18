@@ -59,7 +59,7 @@ def tracked_paths() -> list[Path]:
         check=True,
         text=True,
     )
-    return sorted({Path(name) for name in result.stdout.split('\0') if name})
+    return sorted({Path(name) for name in result.stdout.split('\0') if name}, key=Path.as_posix)
 
 
 def _first_docstring_line(node: ast.AST) -> str:
@@ -108,14 +108,14 @@ def _children(paths: list[Path], directory: Path) -> tuple[list[Path], list[Path
         elif len(parts) > depth + 1:
             subdirs.add(Path(*parts[: depth + 1]))
 
-    return sorted(files), sorted(subdirs)
+    return sorted(files, key=Path.as_posix), sorted(subdirs, key=Path.as_posix)
 
 
 def render_entries(paths: list[Path], directory: Path) -> list[str]:
     files, subdirs = _children(paths, directory)
     lines: list[str] = []
 
-    for entry in sorted(files + subdirs):
+    for entry in sorted(files + subdirs, key=Path.as_posix):
         if entry in subdirs:
             lines.append(f'- `{entry.as_posix()}/`')
             continue

@@ -15,37 +15,42 @@
 - `.gitignore` — файл
 - `.python-version` — файл
 - `.release-please-manifest.json` — файл
+- `CHANGELOG.md` — файл
+- `CONTRIBUTING.md` — файл
+- `Dockerfile` — файл
+- `LICENSE` — файл
+- `Makefile` — файл
+- `README.md` — файл
+- `SECURITY.md` — файл
 - `alembic.ini` — файл
 - `app/`
 - `assets/`
-- `CHANGELOG.md` — файл
-- `CONTRIBUTING.md` — файл
 - `docker-compose.local.yml` — файл
 - `docker-compose.yml` — файл
-- `Dockerfile` — файл
 - `docs/`
-- `LICENSE` — файл
 - `main.py` — Python-модуль
   Классы: `GracefulExit` (2 методов)
   Функции: `main`
-- `Makefile` — файл
 - `migrations/`
 - `pyproject.toml` — файл
-- `README.md` — файл
 - `release-please-config.json` — файл
 - `scripts/`
-- `SECURITY.md` — файл
 - `tests/`
 - `uv.lock` — файл
 - `vpn_logo.png` — файл
 
 ## .github
 
+- `.github/ISSUE_TEMPLATE/`
 - `.github/assets/`
 - `.github/codeql/`
 - `.github/dependabot.yml` — файл
-- `.github/ISSUE_TEMPLATE/`
 - `.github/workflows/`
+
+### .github/ISSUE_TEMPLATE
+
+- `.github/ISSUE_TEMPLATE/bug-bedolage.md` — файл
+- `.github/ISSUE_TEMPLATE/feat-bedolage.md` — файл
 
 ### .github/assets
 
@@ -59,11 +64,6 @@
 ### .github/codeql
 
 - `.github/codeql/codeql-config.yml` — файл
-
-### .github/ISSUE_TEMPLATE
-
-- `.github/ISSUE_TEMPLATE/bug-bedolage.md` — файл
-- `.github/ISSUE_TEMPLATE/feat-bedolage.md` — файл
 
 ### .github/workflows
 
@@ -587,8 +587,8 @@
 
 ##### app/cabinet/utils/fonts
 
-- `app/cabinet/utils/fonts/manrope-variable.ttf` — файл
 - `app/cabinet/utils/fonts/OFL.txt` — файл
+- `app/cabinet/utils/fonts/manrope-variable.ttf` — файл
 
 ### app/database
 
@@ -3043,7 +3043,7 @@
   Функции: `test_start_main_menu_text_delegates_to_menu_builder`, `test_start_no_longer_has_duplicate_status_formatter` — The duplicate formatter that caused the /start-vs-menu divergence is gone.
 - `tests/test_structure_reference_is_current.py` — Python-модуль
   Классы: нет
-  Функции: `test_document_matches_the_code`, `test_only_tracked_files_are_listed` — Документ не должен зависеть от мусора в рабочей копии., `test_generator_is_deterministic` — Два запуска подряд дают один и тот же текст., `test_payment_mixins_are_documented` — Ровно та дыра, из-за которой всё это затевалось.
+  Функции: `test_document_matches_the_code`, `test_only_tracked_files_are_listed` — Документ не должен зависеть от мусора в рабочей копии., `test_generator_is_deterministic` — Два запуска подряд дают один и тот же текст., `test_payment_mixins_are_documented` — Ровно та дыра, из-за которой всё это затевалось., `test_generation_order_is_identical_on_windows_and_posix`
 - `tests/test_subscription_cart_integration.py` — Python-модуль
   Классы: нет
   Функции: `mock_callback_query`, `mock_user`, `mock_db`, `mock_state`, `test_save_cart_and_redirect_to_topup` — Тест сохранения корзины и перенаправления к пополнению, `test_return_to_saved_cart_success` — Тест возврата к сохраненной корзине с достаточным балансом, `test_return_to_saved_cart_skips_edit_when_message_matches`, `test_return_to_saved_cart_normalizes_devices_when_disabled`, `test_return_to_saved_cart_insufficient_funds` — Тест возврата к сохраненной корзине с недостаточным балансом, `test_clear_saved_cart` — Тест очистки сохраненной корзины, `test_handle_subscription_cancel_clears_saved_cart` — Отмена покупки должна очищать сохраненную корзину, `test_handle_subscription_cancel_clears_only_current_subscription_cart` — Отмена покупки в мультитарифном сценарии чистит только корзину текущей подписки
@@ -3235,7 +3235,7 @@
   Функции: `test_windows_come_from_settings_and_are_checked_in_order`, `test_tripped_slow_window_returns_429_with_its_retry_after`, `test_zero_disables_a_window`, `test_standalone_registration_uses_the_throttle` — Боевой обработчик зовёт общий дроссель, а не свой минутный лимит.
 - `tests/cabinet/test_email_rendering_integrity.py` — Python-модуль
   Классы: нет
-  Функции: `test_default_template_renders_clean_for_every_language`, `captured_send` — Перехватывает send_email и притворяется, что SMTP настроен., `test_verification_email_uses_unified_template`, `test_password_reset_email_uses_unified_template`, `test_email_change_code_uses_unified_template`, `test_custom_override_bypasses_default_rendering`, `test_wrap_full_document_is_not_double_wrapped`, `test_wrap_fragment_gets_base_template_once`, `test_wrap_styled_fragment_gets_minimal_wrapper`, `test_editor_default_roundtrips_through_override_render` — Сохранение дефолта из редактора как override не ломает письмо.
+  Функции: `test_default_template_renders_clean_for_every_language`, `test_dimension_email_subject_preserves_literal_angle_brackets`, `captured_send` — Перехватывает send_email и притворяется, что SMTP настроен., `test_verification_email_uses_unified_template`, `test_password_reset_email_uses_unified_template`, `test_email_change_code_uses_unified_template`, `test_custom_override_bypasses_default_rendering`, `test_wrap_full_document_is_not_double_wrapped`, `test_wrap_fragment_gets_base_template_once`, `test_wrap_styled_fragment_gets_minimal_wrapper`, `test_editor_default_roundtrips_through_override_render` — Сохранение дефолта из редактора как override не ломает письмо.
 - `tests/cabinet/test_email_reply_to.py` — Python-модуль
   Классы: нет
   Функции: `smtp_ready`, `test_reply_to_is_set_when_configured` — Настроенный адрес попадает в Reply-To, From остаётся прежним., `test_no_reply_to_header_by_default` — Пустая настройка — поведение как раньше, лишнего заголовка нет., `test_broken_reply_to_is_dropped` — Мусор из .env не должен ни ломать письмо, ни дописывать чужой заголовок., `test_reply_to_is_trimmed` — Пробелы вокруг адреса обязаны срезаться до сборки заголовка.
@@ -3439,7 +3439,7 @@
   Функции: нет
 - `tests/ci/test_workflow_versions.py` — Python-модуль
   Классы: нет
-  Функции: `test_every_action_is_pinned_to_a_single_version` — Одно действие — одна версия во всём репозитории., `test_all_actions_are_pinned` — Плавающих ссылок вроде @main или @master быть не должно., `test_python_version_is_the_same_everywhere` — Тесты, линтер и аудит обязаны идти на одной версии Python., `test_python_version_matches_pyproject` — CI не должен проверять код на версии, которую проект не поддерживает., `test_postgres_image_matches_production_compose` — Тестовая база должна быть той же версии, что и боевая.
+  Функции: `test_all_actions_are_pinned` — Плавающих ссылок вроде @main или @master быть не должно., `test_python_version_is_the_same_everywhere` — Тесты, линтер и аудит обязаны идти на одной версии Python., `test_python_version_matches_pyproject` — CI не должен проверять код на версии, которую проект не поддерживает., `test_postgres_image_matches_production_compose` — Тестовая база должна быть той же версии, что и боевая.
 
 ### tests/contracts
 
@@ -3447,9 +3447,6 @@
 - `tests/contracts/test_bschek_geo_client_paths_match_spec.py` — Python-модуль
   Классы: нет
   Функции: `test_every_geo_call_of_the_client_exists_in_the_spec`, `test_client_covers_the_five_endpoints_we_use`
-- `tests/contracts/test_local_day_guard.py` — Python-модуль
-  Классы: нет
-  Функции: `find_violations`, `test_known_utc_sites_still_exist` — Список исключений не должен пережить переименование: каждая функция обязана существовать., `test_detector_sees_every_idiom` — Сторож не ослеп: на синтетическом примере находит все пять идиом., `test_app_has_no_hand_made_utc_days`
 - `tests/contracts/test_projection_reads_grace_marker_after_snapshot.py` — Python-модуль
   Классы: нет
   Функции: `test_every_projection_reads_the_grace_marker_after_the_panel_snapshot`
@@ -3459,9 +3456,6 @@
 - `tests/contracts/test_reachability_route_reads_real_panel_fields.py` — Python-модуль
   Классы: нет
   Функции: `test_route_reads_only_fields_that_exist_on_panel_dataclasses`
-- `tests/contracts/test_remnawave_client_paths_match_spec.py` — Python-модуль
-  Классы: нет
-  Функции: `test_client_calls_only_endpoints_that_exist_in_panel_spec`, `test_legacy_allowlist_entries_are_really_absent_from_spec` — Если ручка из allowlist вернулась в спецификацию, запись устарела — убрать.
 - `tests/contracts/test_renewal_applies_tariff_traffic_rule.py` — Python-модуль
   Классы: нет
   Функции: `collect_offenders`, `test_every_renewal_applies_the_tariff_traffic_rule`, `test_known_exceptions_still_exist` — Список исключений не должен протухать: переименовали функцию — обнови причину., `test_detector_sees_the_recurring_gateways` — Самопроверка детектора: рекуррентные Lava и Platega двигают дату методом модели.
@@ -3475,7 +3469,6 @@
 #### tests/contracts/fixtures
 
 - `tests/contracts/fixtures/bschek_geo_openapi_2026-09-11.json` — файл
-- `tests/contracts/fixtures/remnawave_api_3_4_3_endpoints.json` — файл
 
 ### tests/crud
 
@@ -3703,6 +3696,7 @@
 
 #### tests/fixtures/bschek
 
+- `tests/fixtures/bschek/README.md` — файл
 - `tests/fixtures/bschek/account.json` — файл
 - `tests/fixtures/bschek/auth_bad.json` — файл
 - `tests/fixtures/bschek/auth_none.json` — файл
@@ -3724,15 +3718,15 @@
 - `tests/fixtures/bschek/p2_replay.json` — файл
 - `tests/fixtures/bschek/p3_bare_mts.json` — файл
 - `tests/fixtures/bschek/p4_bare_mts_any.json` — файл
+- `tests/fixtures/bschek/pF_fleet.json` — файл
+- `tests/fixtures/bschek/pF_replay_0.json` — файл
+- `tests/fixtures/bschek/pF_replay_late.json` — файл
+- `tests/fixtures/bschek/pF_same_key_while_running.json` — файл
 - `tests/fixtures/bschek/p_blocked.json` — файл
 - `tests/fixtures/bschek/p_dpi_off.json` — файл
 - `tests/fixtures/bschek/p_empty_ops.json` — файл
 - `tests/fixtures/bschek/p_legacy_alias.json` — файл
 - `tests/fixtures/bschek/p_noidem.json` — файл
-- `tests/fixtures/bschek/pF_fleet.json` — файл
-- `tests/fixtures/bschek/pF_replay_0.json` — файл
-- `tests/fixtures/bschek/pF_replay_late.json` — файл
-- `tests/fixtures/bschek/pF_same_key_while_running.json` — файл
 - `tests/fixtures/bschek/pv_11_targets.json` — файл
 - `tests/fixtures/bschek/pv_all_any.json` — файл
 - `tests/fixtures/bschek/pv_all_default.json` — файл
@@ -3760,7 +3754,6 @@
 - `tests/fixtures/bschek/pv_two_targets.json` — файл
 - `tests/fixtures/bschek/pv_unknown_op.json` — файл
 - `tests/fixtures/bschek/pv_url_target.json` — файл
-- `tests/fixtures/bschek/README.md` — файл
 - `tests/fixtures/bschek/rl2_a.json` — файл
 - `tests/fixtures/bschek/rl2_b.json` — файл
 - `tests/fixtures/bschek/s1_poll_00.json` — файл
@@ -3768,8 +3761,6 @@
 - `tests/fixtures/bschek/s1_poll_03.json` — файл
 - `tests/fixtures/bschek/s1_second.json` — файл
 - `tests/fixtures/bschek/s1_submit.json` — файл
-- `tests/fixtures/bschek/s_cancel_done.json` — файл
-- `tests/fixtures/bschek/s_notfound.json` — файл
 - `tests/fixtures/bschek/sB_after_0.json` — файл
 - `tests/fixtures/bschek/sB_cancel.json` — файл
 - `tests/fixtures/bschek/sB_cancel_again.json` — файл
@@ -3780,6 +3771,8 @@
 - `tests/fixtures/bschek/sC_submit.json` — файл
 - `tests/fixtures/bschek/sD_poll_37.json` — файл
 - `tests/fixtures/bschek/sD_submit.json` — файл
+- `tests/fixtures/bschek/s_cancel_done.json` — файл
+- `tests/fixtures/bschek/s_notfound.json` — файл
 - `tests/fixtures/bschek/sv_25.json` — файл
 - `tests/fixtures/bschek/sv_all_any.json` — файл
 - `tests/fixtures/bschek/sv_cfo_any_sni.json` — файл
@@ -3797,12 +3790,6 @@
 - `tests/fixtures/bschek/v2_replay.json` — файл
 - `tests/fixtures/bschek/v2_status.json` — файл
 - `tests/fixtures/bschek/v2_submit.json` — файл
-- `tests/fixtures/bschek/v_cancel_done.json` — файл
-- `tests/fixtures/bschek/v_noconfigs.json` — файл
-- `tests/fixtures/bschek/v_notfound.json` — файл
-- `tests/fixtures/bschek/v_suburl.json` — файл
-- `tests/fixtures/bschek/v_too_large.json` — файл
-- `tests/fixtures/bschek/v_too_many.json` — файл
 - `tests/fixtures/bschek/vA_poll_02.json` — файл
 - `tests/fixtures/bschek/vA_submit.json` — файл
 - `tests/fixtures/bschek/vB_poll_34.json` — файл
@@ -3815,6 +3802,12 @@
 - `tests/fixtures/bschek/vD_submit.json` — файл
 - `tests/fixtures/bschek/vE_poll_01.json` — файл
 - `tests/fixtures/bschek/vE_submit.json` — файл
+- `tests/fixtures/bschek/v_cancel_done.json` — файл
+- `tests/fixtures/bschek/v_noconfigs.json` — файл
+- `tests/fixtures/bschek/v_notfound.json` — файл
+- `tests/fixtures/bschek/v_suburl.json` — файл
+- `tests/fixtures/bschek/v_too_large.json` — файл
+- `tests/fixtures/bschek/v_too_many.json` — файл
 
 ### tests/handlers
 
@@ -4617,7 +4610,7 @@
   Функции: `test_pre_multitariff_sibling_with_future_end_date_not_expired`, `test_sibling_alive_in_panel_via_user_panel_id_fallback_not_expired`, `test_sibling_not_expired_on_transient_api_error`, `test_sibling_not_expired_on_panel_validation_400` — 400 VALIDATION — не «пользователя нет»., `test_sibling_not_expired_when_local_panel_id_is_unusable` — Битый локальный идентификатор — баг данных бота, а не «юзера нет»., `test_sibling_genuinely_gone_is_still_expired` — Don't break legitimate expiry: panel says gone (None == 404) + past end_date -> expire., `test_intentional_panel_deletion_suppresses_sibling_sweep`, `test_single_tariff_sibling_with_its_own_live_account_is_not_expired` — Однотарифный режим не покрывался ни одним тестом., `test_single_tariff_sibling_without_any_live_account_is_expired` — А если и его собственный ключ панель не знает — истекаем, это и есть смысл цикла.
 - `tests/services/test_webhook_user_modified_fields.py` — Python-модуль
   Классы: нет
-  Функции: `service`, `test_panel_date_wins_for_a_live_subscription`, `test_disabled_subscription_does_not_get_its_days_back` — Обнуление админом: старая дата из панели вернула бы списанные дни., `test_panel_disabled_disables_the_subscription`, `test_webhook_never_declares_a_subscription_expired` — Истечение объявляет мониторинг: у него буфер и уведомления., `test_traffic_limit_and_nested_usage_are_synced` — Расширенная схема панели прячет расход в userTraffic, плоского поля там нет., `test_device_limit_is_never_taken_from_a_webhook` — Лимит устройств задаёт тариф в боте., `test_a_link_that_fails_validation_is_not_stored`, `test_a_valid_link_replaces_the_stored_one`, `test_every_event_stamps_the_subscription` — Метка защищает свежие данные от затирания медленным полным проходом., `test_open_grace_freezes_the_billing_fields`
+  Функции: `service`, `test_panel_date_wins_for_a_live_subscription`, `test_disabled_subscription_does_not_get_its_days_back` — Обнуление админом: старая дата из панели вернула бы списанные дни., `test_panel_disabled_disables_the_subscription`, `test_webhook_never_declares_a_subscription_expired` — Истечение объявляет мониторинг: у него буфер и уведомления., `test_nested_usage_is_synced_without_importing_shielded_traffic_limit` — Расширенная схема панели прячет расход в userTraffic, плоского поля там нет., `test_device_limit_is_never_taken_from_a_webhook` — Лимит устройств задаёт тариф в боте., `test_a_link_that_fails_validation_is_not_stored`, `test_a_valid_link_replaces_the_stored_one`, `test_every_event_stamps_the_subscription` — Метка защищает свежие данные от затирания медленным полным проходом., `test_open_grace_freezes_the_billing_fields`
 - `tests/services/test_yandex_purchase_hook.py` — Python-модуль
   Классы: нет
   Функции: `test_passes_cid_through_to_store_and_fires_purchase` — Frontend cached CID → backend stores it, then fires purchase event., `test_no_cid_still_fires_purchase_event` — If the separate /yandex-cid POST already completed, frontend may pass, `test_disabled_feature_skips_everything` — When offline conversions are off, neither store nor fire should run., `test_store_failure_does_not_block_purchase_event` — Even if persisting the CID throws, the purchase event must still fire —
@@ -4824,7 +4817,7 @@
   Функции: `moscow`, `test_complaint_case_is_day_after_tomorrow`, `test_later_today_is_zero`, `test_short_time_across_local_midnight_is_tomorrow`, `test_calendar_day_follows_operator_zone_not_utc`, `test_expired_is_zero`, `test_naive_values_are_utc`, `test_time_left_keeps_partial_day`, `test_time_left_units`, `test_ends_within_days`, `test_expiry_warning`, `test_days_left_rounded_up`
 - `tests/utils/test_tag_stripping_is_linear.py` — Python-модуль
   Классы: нет
-  Функции: `test_no_quadratic_tag_pattern_remains` — Шаблон `<[^>]+>` не должен вернуться ни в один модуль., `test_stripping_keeps_text_and_bare_angle_brackets`, `test_pathological_input_stays_fast` — Строка из одних «<» — ровно тот вход, на котором старый шаблон вставал., `test_visible_length_uses_the_linear_pattern` — Функция, на которую указал CodeQL, считает длину тем же способом., `test_html_validator_stays_fast_on_unclosed_tags` — Проверка HTML правовых страниц: их длина из кабинета ничем не ограничена., `test_html_validator_verdicts_unchanged` — Ускорение не должно менять вердикты на обычной разметке.
+  Функции: `test_stripping_keeps_text_and_bare_angle_brackets`, `test_pathological_input_stays_fast` — Строка из одних «<» — ровно тот вход, на котором старый шаблон вставал., `test_html_validator_stays_fast_on_unclosed_tags` — Проверка HTML правовых страниц: их длина из кабинета ничем не ограничена., `test_html_validator_verdicts_unchanged` — Ускорение не должно менять вердикты на обычной разметке.
 - `tests/utils/test_telegram_delivery.py` — Python-модуль
   Классы: нет
   Функции: `test_expected_delivery_refusals_are_unreachable`, `test_other_errors_are_not_unreachable`, `test_reason_is_plain_russian`
